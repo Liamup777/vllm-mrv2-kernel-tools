@@ -1,0 +1,15 @@
+vLLM Kernel Tools
+
+kernel_tools/benchmark.py is derived from:
+  vllm-project/vllm-ascend, branch kernel_test_frame
+  commit d5f7c665c8345294482ff0826de5f9bda699310b
+  benchmarks/ops/benchmark_wrapper.py
+
+The source repository is licensed under the Apache License, Version 2.0.
+The license text is reproduced in LICENSE.
+
+Modifications in this repository include lazy NPU imports, a dataclass-safe
+module loader, deterministic seeds, explicit tensor values, optional input
+reset and correctness callbacks, actual binding metadata, and structured
+worker errors. The surrounding CLI, orchestration and scanner are maintained
+independently of the vLLM and vLLM-Ascend source checkouts.

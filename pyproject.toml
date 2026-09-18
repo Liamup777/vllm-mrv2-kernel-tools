@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-kernel-tools"
+version = "0.1.0"
+description = "Inspect vLLM Triton release changes and run reproducible Ascend operator cases"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+dependencies = []
+
+[project.scripts]
+kernel-tools = "kernel_tools.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["kernel_tools*"]
+
+[tool.setuptools.data-files]
+"share/vllm-kernel-tools" = ["README.md"]
+"share/vllm-kernel-tools/docs" = ["docs/cases.md", "docs/scanning.md", "docs/pipeline.md"]
+"share/vllm-kernel-tools/skills/vllm-triton-release-scan" = ["skills/vllm-triton-release-scan/SKILL.md"]
+"share/vllm-kernel-tools/skills/vllm-ascend-kernel-cases" = ["skills/vllm-ascend-kernel-cases/SKILL.md"]
+"share/vllm-kernel-tools/skills/vllm-triton-remote-benchmark" = ["skills/vllm-triton-remote-benchmark/SKILL.md"]

@@ -1,0 +1,289 @@
+import contextlib
+import copy
+import io
+import json
+import os
+import subprocess
+import sys
+import tarfile
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from kernel_tools.benchmark import resolve_wrapper
+from kernel_tools.cases import load_cases, select_cases, validate_cases
+from kernel_tools.common import save_json
+from kernel_tools.remote import safe_extract, target_command, run_remote
+from kernel_tools.runner import device_lock, run_suite
+from kernel_tools.scan import compare, scan
+
+
+def case(name="ok", kernel="test_kernel"):
+    return {"name": name, "kernel": kernel, "mode": "triton", "wrapper": "fixture:kernel",
+            "grid": [1], "arguments": {"x": {"shape": [3], "dtype": "int32", "initializer": "arange"}}}
+
+
+class CasesTest(unittest.TestCase):
+    def test_legacy_kwargs_jsonl_and_filter(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cases.jsonl"
+            old = case()
+            old["kwargs"] = old.pop("arguments")
+            path.write_text(json.dumps(old) + "\n" + json.dumps(case("second")))
+            self.assertEqual(len(load_cases(path)), 2)
+            self.assertEqual(select_cases(load_cases(path), case_name="second")[0]["name"], "second")
+
+    def test_duplicate_ambiguous_and_unsupported_tensor(self):
+        with self.assertRaisesRegex(ValueError, "Duplicate"):
+            validate_cases([case(), case()])
+        with self.assertRaisesRegex(ValueError, "multiple kernels"):
+            select_cases([case(), case(kernel="other")], case_name="ok")
+        invalid = case()
+        invalid["arguments"]["x"]["stride"] = [2]
+        with self.assertRaisesRegex(ValueError, "adapter"):
+            validate_cases([invalid])
+
+    def test_pointer_contract_and_explicit_values(self):
+        c = case()
+        c["arguments"]["x"] = {"shape": [2], "dtype": "uint64", "initializer": "data_ptrs",
+                                  "pointees": [{"shape": [4]}, {"shape": [3]}]}
+        validate_cases([c])
+        c["arguments"]["x"]["shape"] = [1]
+        with self.assertRaisesRegex(ValueError, "data_ptrs"):
+            validate_cases([c])
+        c["arguments"]["x"] = {"shape": [2, 2], "initializer": "values", "values": [[1, 2], [3, 4]]}
+        validate_cases([c])
+        c["arguments"]["x"]["values"] = [1]
+        with self.assertRaisesRegex(ValueError, "count"):
+            validate_cases([c])
+
+    def test_file_loader_registers_dataclasses(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "module with spaces.py"
+            file.write_text("from __future__ import annotations\nfrom dataclasses import dataclass\n"
+                            "@dataclass\nclass Value:\n    n: int\ndef launch():\n    return Value(7)\n")
+            self.assertEqual(resolve_wrapper(str(file) + ":launch")().n, 7)
+
+
+FAKE_WORKER = r'''
+import argparse, json, time
+from pathlib import Path
+p=argparse.ArgumentParser()
+for key in ('input-file','kernel','case-name','wrapper','mode','device','warmup','profiling-rounds','output'):
+    p.add_argument('--'+key,required=True)
+a=p.parse_args()
+case=json.loads(Path(a.input_file).read_text())[0]
+if a.case_name=='timeout':
+    print('before timeout',flush=True)
+    time.sleep(10)
+if a.case_name=='fail':
+    print('CompilationError: UB overflow, full diagnostic line')
+    Path(a.output).write_text(json.dumps({'error':{'phase':'runtime','reason':'CompilationError: UB overflow'}}))
+    raise SystemExit(1)
+if a.case_name=='wrong':
+    Path(a.output).write_text(json.dumps({'error':{'phase':'correctness','reason':'AssertionError: output differs'}}))
+    raise SystemExit(1)
+row={k:case[k] for k in ('name','kernel','wrapper','mode')}
+row.update(device=a.device,warmup=int(a.warmup),profiling_rounds=int(a.profiling_rounds),
+           latencies_ms=[.01]*int(a.profiling_rounds),
+           summary={k+'_ms':.01 for k in ('mean','p50','p90','p99','min','max')},
+           correctness='passed' if case.get('check') else 'not_checked')
+if a.case_name=='bad_identity': row['kernel']='wrong_kernel'
+if a.case_name=='bad_samples': row['latencies_ms']=[]
+Path(a.output).write_text(json.dumps([row]))
+'''
+
+
+class RunnerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.worker = self.root / "fake worker.py"
+        self.worker.write_text(FAKE_WORKER)
+        self.output = self.root / "run"
+        self.info = {"npu_available": True, "python": "fake-for-protocol-test"}
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def run_cases(self, cases, **kwargs):
+        with contextlib.redirect_stdout(io.StringIO()):
+            return run_suite(cases, cwd=self.root, output=self.output, rounds=2,
+                             timeout=.5, probe_info=self.info,
+                             worker_command=[sys.executable, str(self.worker)], **kwargs)
+
+    def rows(self):
+        return [r for p in (self.output / "results").glob("*.json")
+                for r in json.loads(p.read_text())["scenarios"]]
+
+    def test_failure_timeout_continues_and_only_failed_logs(self):
+        self.assertEqual(self.run_cases([case("fail"), case("timeout"), case("ok")]), 1)
+        rows = self.rows()
+        self.assertEqual([r["status"] for r in rows], ["failed", "failed", "success"])
+        self.assertEqual(rows[0]["failure"]["phase"], "compile")
+        self.assertEqual(rows[1]["failure"]["phase"], "timeout")
+        self.assertEqual(rows[2]["correctness"], "not_checked")
+        self.assertAlmostEqual(rows[2]["latency_us"]["mean"], 10.)
+        self.assertEqual(len(list((self.output / "logs").rglob("*.log"))), 2)
+        self.assertIn("full diagnostic line", (self.output / rows[0]["log"]).read_text())
+        self.assertNotIn("latencies_ms", next((self.output / "results").glob("*.json")).read_text())
+
+    def test_reject_wrong_identity_and_missing_samples(self):
+        self.run_cases([case("bad_identity"), case("bad_samples")])
+        self.assertEqual([r["failure"]["phase"] for r in self.rows()], ["result", "result"])
+
+    def test_correctness_failure_is_separate(self):
+        self.run_cases([case("wrong")])
+        self.assertEqual(self.rows()[0]["correctness"], "failed")
+        self.assertNotIn("latency_us", self.rows()[0])
+
+    def test_blocked_environment_still_writes_every_case(self):
+        self.info = {"npu_available": False, "npu_error": "No torch_npu"}
+        self.assertEqual(self.run_cases([case(), case("second")]), 1)
+        self.assertEqual([r["status"] for r in self.rows()], ["blocked", "blocked"])
+
+    def test_source_changed_after_generation_blocks_worker(self):
+        self.assertEqual(self.run_cases([case()], expected_identity="mismatched-fingerprint"), 1)
+        row = self.rows()[0]
+        self.assertEqual(row["status"], "blocked")
+        self.assertEqual(row["attempts"], 0)
+        self.assertIn("changed since AI", row["failure"]["reason"])
+
+    def test_no_overwrite_and_strict_resume(self):
+        snapshot = {"path": str(self.root), "head": "a" * 40, "dirty": False}
+        with patch("kernel_tools.runner.source_snapshot", return_value=snapshot):
+            self.assertEqual(self.run_cases([case()]), 0)
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                self.run_cases([case()])
+            self.assertEqual(self.run_cases([case()], resume=True), 0)
+            self.assertEqual(self.rows()[0]["attempts"], 1)
+            with self.assertRaisesRegex(ValueError, "changed"):
+                self.run_cases([case("changed")], resume=True)
+
+    def test_device_lock_prevents_overlap(self):
+        with device_lock("npu:999"):
+            with self.assertRaisesRegex(ValueError, "Another"):
+                with device_lock("npu:999"):
+                    pass
+
+    def test_busy_device_leaves_blocked_results(self):
+        with device_lock("npu:0"):
+            self.assertEqual(self.run_cases([case(), case("second")]), 1)
+        self.assertEqual([r["status"] for r in self.rows()], ["blocked", "blocked"])
+
+
+class ScanTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.git("init", "-q")
+        self.git("config", "user.email", "test@example.invalid")
+        self.git("config", "user.name", "Test")
+        self.write("vllm/v1/worker/gpu/sample.py", """import triton
+from vllm.ops.outer import launch as imported_launch
+@triton.jit
+def helper(x): return x + 1
+@triton.jit
+def local(x): return helper(x)
+def wrapper(x): local[(1,)](x)
+def caller(x): imported_launch(x)
+def dynamic(x): factory()[1](x)
+""")
+        self.write("vllm/ops/outer.py", """import triton
+@triton.jit
+def external(x): return x
+def launch(x): external[(1,)](x)
+""")
+        self.commit("v1.0.0")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def git(self, *args):
+        return subprocess.check_output(["git", "-C", str(self.root), *args], stderr=subprocess.DEVNULL, text=True).strip()
+
+    def write(self, path, value):
+        file = self.root / path
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(value)
+
+    def commit(self, tag):
+        self.git("add", ".")
+        self.git("commit", "-qm", tag)
+        self.git("tag", tag)
+
+    def test_imported_launch_helper_and_dynamic(self):
+        result = scan(self.root, "v1.0.0")
+        self.assertEqual({k["kernel"] for k in result["kernels"]}, {"local", "external"})
+        self.assertEqual(len(result["unresolved_launches"]), 1)
+        self.assertEqual(len(result["unlaunched_jit"]), 1)
+        self.assertFalse(result["complete_inventory"])
+        external = next(k for k in result["kernels"] if k["kernel"] == "external")
+        self.assertEqual(external["source_type"], "imported")
+        self.assertEqual(external["launches"][0]["call_path"],
+                         ["vllm.v1.worker.gpu.sample.caller", "vllm.ops.outer.launch"])
+
+    def test_helper_change_retests_callers_and_uses_tag_not_branch(self):
+        base = scan(self.root, "v1.0.0")
+        file = self.root / "vllm/v1/worker/gpu/sample.py"
+        file.write_text(file.read_text().replace("x + 1", "x + 2"))
+        self.commit("v1.1.0")
+        self.git("branch", "v1.0.0")
+        target = scan(self.root, "v1.1.0")
+        self.assertEqual(scan(self.root, "v1.0.0")["commit"], base["commit"])
+        delta = compare(base, target)
+        changed = next(x for x in delta["changed"] if x["id"].endswith(".local"))
+        self.assertIn("dependency", changed["changes"])
+        self.assertNotIn("body", changed["changes"])
+
+class TransportTest(unittest.TestCase):
+    def test_upload_execute_download_with_local_ssh_transport(self):
+        # Exercise real tar transfer / subprocess execution / result download,
+        # replacing only the SSH wire with a local shell. No NPU or network.
+        import venv
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv.EnvBuilder(with_pip=False).create(root / "python")
+            assets = root / "adapters"
+            assets.mkdir()
+            (assets / "fixture_reference.py").write_text("def check(args, kwargs, output):\n    assert output == 1\n")
+            target = {"host": "simulated", "cwd": str(root),
+                      "python": str(root / "python/bin/python"), "result_root": str(root / "remote")}
+            def local_wire(target, command):
+                return ["bash", "-c", command]
+            with patch("kernel_tools.remote.ssh_command", side_effect=local_wire):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    status = run_remote(target, [case()], root / "download", assets=assets)
+            self.assertEqual(status, 1)
+            self.assertTrue((root / "download/report.md").is_file())
+            self.assertEqual((root / "download/adapters/fixture_reference.py").read_text(),
+                             (assets / "fixture_reference.py").read_text())
+            result = json.loads(next((root / "download/results").glob("*.json")).read_text())
+            self.assertEqual(result["scenarios"][0]["status"], "blocked")
+
+    def test_command_quotes_paths_and_values(self):
+        target = {"cwd": "/source/a b", "container": "vllm", "pythonpath": ["/source/a b"],
+                  "setup": "/opt/a b/setup.sh", "env": {"VALUE": "$(false); x"}}
+        command = target_command(target, ["python", "-m", "kernel_tools", "doctor"])
+        import shlex
+        argv = shlex.split(command)
+        self.assertEqual(argv[:5], ["docker", "exec", "vllm", "bash", "-lc"])
+        self.assertIn("'VALUE=$(false); x'", argv[-1])
+
+    def test_archive_rejects_traversal_and_symlinks(self):
+        for name, kind in [("../../outside", tarfile.REGTYPE), ("link", tarfile.SYMTYPE)]:
+            with tempfile.TemporaryDirectory() as tmp:
+                stream = io.BytesIO()
+                with tarfile.open(fileobj=stream, mode="w") as tar:
+                    member = tarfile.TarInfo(name)
+                    member.type = kind
+                    tar.addfile(member)
+                stream.seek(0)
+                with tarfile.open(fileobj=stream) as tar:
+                    with self.assertRaisesRegex(ValueError, "Unsafe"):
+                        safe_extract(tar, tmp)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,0 +1,112 @@
+[
+  {
+    "name": "smoke_b1",
+    "kernel": "_fill_num_accepted_kernel",
+    "mode": "triton",
+    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
+    "grid": [
+      1
+    ],
+    "seed": 42,
+    "check": "kernel_tools.references:check_fill_num_accepted",
+    "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
+    "source": {
+      "repository": "vllm-project/vllm",
+      "commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+      "definition": "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+      "binding": "upstream; recheck on selected Ascend checkout"
+    },
+    "arguments": {
+      "idx_mapping_ptr": {
+        "shape": [
+          1
+        ],
+        "dtype": "int32",
+        "initializer": "arange"
+      },
+      "num_accepted_ptr": {
+        "shape": [
+          4
+        ],
+        "dtype": "int32",
+        "initializer": "zeros"
+      },
+      "num_sampled": 1
+    }
+  },
+  {
+    "name": "typical_b32",
+    "kernel": "_fill_num_accepted_kernel",
+    "mode": "triton",
+    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
+    "grid": [
+      32
+    ],
+    "seed": 42,
+    "check": "kernel_tools.references:check_fill_num_accepted",
+    "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
+    "source": {
+      "repository": "vllm-project/vllm",
+      "commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+      "definition": "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+      "binding": "upstream; recheck on selected Ascend checkout"
+    },
+    "arguments": {
+      "idx_mapping_ptr": {
+        "shape": [
+          32
+        ],
+        "dtype": "int32",
+        "initializer": "arange"
+      },
+      "num_accepted_ptr": {
+        "shape": [
+          32
+        ],
+        "dtype": "int32",
+        "initializer": "zeros"
+      },
+      "num_sampled": 1
+    }
+  },
+  {
+    "name": "sentinel_and_reordered_b3",
+    "kernel": "_fill_num_accepted_kernel",
+    "mode": "triton",
+    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
+    "grid": [
+      3
+    ],
+    "seed": 42,
+    "check": "kernel_tools.references:check_fill_num_accepted",
+    "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
+    "source": {
+      "repository": "vllm-project/vllm",
+      "commit": "98dff2a81d747d1dba01a47f939f48c3526d4206",
+      "definition": "vllm/v1/worker/gpu/model_states/mamba_hybrid.py",
+      "binding": "upstream; recheck on selected Ascend checkout"
+    },
+    "arguments": {
+      "idx_mapping_ptr": {
+        "shape": [
+          3
+        ],
+        "dtype": "int32",
+        "initializer": "values",
+        "values": [
+          -1,
+          3,
+          0
+        ]
+      },
+      "num_accepted_ptr": {
+        "shape": [
+          4
+        ],
+        "dtype": "int32",
+        "initializer": "zeros"
+      },
+      "num_sampled": 1
+    }
+  }
+]
