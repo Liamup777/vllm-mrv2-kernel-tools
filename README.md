@@ -45,22 +45,133 @@ kernel-tools --help
 
 ## 从本机跑远端 NPU
 
-先生成一次配置，修改主机、容器、Python 和源码路径：
+先生成配置文件：
 
 ```bash
 python -m kernel_tools init
-# 编辑 kernel-tools.json；内置 npu160 / npu165 示例，不含密码。
-python -m kernel_tools doctor --target npu160
 ```
 
-远端使用已有 SSH key/agent 和已信任的主机指纹。`doctor` 会显示软件版本、实际 import 位置与 npu-smi 信息；确认选用设备空闲。
+这会在当前目录创建 `kernel-tools.json`。文件已存在时不会覆盖，直接编辑即可。每个 `targets` 成员是一套 NPU 环境，名称由 `--target` 或 `--npu` 引用。例如 Docker 环境：
+
+```json
+{
+  "ai": {
+    "codex": "codex"
+  },
+  "targets": {
+    "npu162": {
+      "host": "root@192.168.13.162",
+      "container": "vllm_lmt",
+      "python": "python3",
+      "cwd": "/home/lingmutian/code/vllm-ascend",
+      "pythonpath": [
+        "/home/lingmutian/code/vllm",
+        "/home/lingmutian/code/vllm-ascend"
+      ],
+      "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+      "device": "npu:0",
+      "result_root": "/home/lingmutian/triton_kernel",
+      "env": {
+        "ASCEND_RT_VISIBLE_DEVICES": "0"
+      }
+    }
+  }
+}
+```
+
+字段含义：
+
+| 字段 | 是否必需 | 含义 |
+|---|---|---|
+| `host` | 是 | SSH alias 或 `user@host`。工具使用 `BatchMode=yes`，需提前配置 SSH key/agent 和主机指纹。 |
+| `container` | 否 | Docker 容器名。设置后，后续路径和 Python 都按容器内环境解释；省略则直接在远端宿主机运行。 |
+| `python` | 是 | 远端或容器内 Python 命令，例如 `python3` 或虚拟环境绝对路径。该环境需已安装 Torch、torch_npu、Triton 和 vLLM 运行依赖。 |
+| `cwd` | 是 | vLLM-Ascend 工作目录，必须是远端运行环境中的绝对路径。 |
+| `pythonpath` | 否 | 实际使用的 vLLM、vLLM-Ascend 等源码路径，必须使用绝对路径。顺序就是 `PYTHONPATH` 顺序。 |
+| `setup` | 否 | 执行 Python 前通过 `source` 加载的 Ascend 环境脚本。Docker 模式下必须是容器内路径。 |
+| `device` | 否 | 进程内逻辑设备，默认 `npu:0`。 |
+| `result_root` | 是 | 远端结果保留目录，必须是绝对路径；Docker 模式下是容器内路径，建议对应持久化挂载目录。 |
+| `env` | 否 | 额外环境变量，例如用 `ASCEND_RT_VISIBLE_DEVICES` 把物理卡映射为进程内的 `npu:0`。不要在这里保存密码或 token。 |
+
+裸机环境删除 `container` 即可，例如：
+
+```json
+{
+  "host": "npu-host-alias",
+  "python": "/opt/venvs/vllm/bin/python",
+  "cwd": "/workspace/vllm-ascend",
+  "pythonpath": ["/workspace/vllm", "/workspace/vllm-ascend"],
+  "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+  "device": "npu:0",
+  "result_root": "/workspace/kernel-results"
+}
+```
+
+### 配置 SSH 免密连接
+
+工具执行 SSH 时设置了 `BatchMode=yes`，不会弹出密码输入框，也不读取或保存服务器密码。需要提前配置 SSH key 或可用的 ssh-agent。
+
+本机还没有密钥时先生成一对：
+
+```bash
+ssh-keygen -t ed25519 -C "vllm-kernel-tools"
+```
+
+第一次把公钥安装到 NPU 服务器时，可以在终端中手动输入一次服务器密码：
+
+```bash
+ssh-copy-id root@192.168.13.162
+```
+
+如果系统没有 `ssh-copy-id`，可以使用：
+
+```bash
+cat ~/.ssh/id_ed25519.pub | ssh root@192.168.13.162 \
+  'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'
+```
+
+随后用与工具完全相同的非交互方式检查认证：
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 root@192.168.13.162 true
+```
+
+命令无输出且退出码为 0，就可以在配置中使用 `"host": "root@192.168.13.162"`。也可以在 `~/.ssh/config` 中配置私钥、端口、跳板机或 alias：
+
+```sshconfig
+Host npu162
+  HostName 192.168.13.162
+  User root
+  IdentityFile ~/.ssh/id_ed25519
+```
+
+此时 `kernel-tools.json` 可简化为 `"host": "npu162"`。如果服务器只允许密码登录且不能安装公钥，当前工具不能连接；不要把密码写入配置文件或命令行。
+
+工具不要求 NPU 环境预先安装 `vllm-kernel-tools`。运行时会通过 SSH 把工具代码和 JSON case 上传到远端临时目录；目标环境只需具备被测运行栈。Docker 模式还要求远端用户能执行 `docker exec`、`docker cp`，且目标容器已经启动。
+
+配置后先检查连接、环境和实际 import 路径：
+
+```bash
+python -m kernel_tools doctor --config kernel-tools.json --target npu162
+```
+
+`doctor` 会显示 Python、Torch、torch_npu、Triton、CANN、NPU 状态，以及 vLLM/vLLM-Ascend 的实际 import 位置。若这里显示的源码路径与 `pythonpath` 预期不一致，应先修正配置，不要直接运行 pipeline。
+
+只检查将要使用的 SSH/Docker 命令而不连接远端：
+
+```bash
+python -m kernel_tools doctor --config kernel-tools.json --target npu162 --dry-run
+```
+
+确认环境后运行单算子 case：
 
 ```bash
 python -m kernel_tools run examples/fill_num_accepted.json \
-  --target npu160 --case-name smoke_b1 --output artifacts/smoke
+  --config kernel-tools.json --target npu162 \
+  --case-name smoke_b1 --output artifacts/smoke
 
 python -m kernel_tools run examples/fill_num_accepted.json \
-  --target npu160 --output artifacts/fill-all
+  --config kernel-tools.json --target npu162 --output artifacts/fill-all
 ```
 
 工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造和可选 reference 由统一测试框架提供，自动流程不生成辅助 Python 文件。
