@@ -55,7 +55,6 @@ def parser():
     run.add_argument("--timeout", type=float, default=600)
     run.add_argument("--output", type=Path)
     run.add_argument("--resume", action="store_true", help="仅本地；需原 --output 和完全相同的输入、源码、环境")
-    run.add_argument("--assets", type=Path, help="随 case 保存和上传的 adapter/reference Python 包目录")
     run.add_argument("--expected-source-fingerprint", help=argparse.SUPPRESS)
     run.add_argument("--dry-run", action="store_true", help="只显示计划，不连接设备")
     scan = sub.add_parser("scan", help="调用 AI 和 release-scan skill，核实两个 tag 之间的新增算子")
@@ -63,7 +62,7 @@ def parser():
     scan.add_argument("--base", required=True)
     scan.add_argument("--target", required=True)
     scan.add_argument("--scope", default="vllm/v1/worker/gpu")
-    scan.add_argument("--output", type=Path, required=True)
+    scan.add_argument("--output", type=Path, help="默认写入用户数据目录，不写入工具仓库")
     scan.add_argument("--config", type=Path, default=Path("kernel-tools.json"), help="可选；仅读取 ai 配置，不需要 NPU 配置")
     scan.add_argument("--codex", help="Codex CLI 路径；默认读配置 ai.codex 或 PATH")
     scan.add_argument("--model", help="默认使用 Codex 配置的模型")
@@ -85,7 +84,7 @@ def parser():
     flow.add_argument("--rounds", type=int, default=100)
     flow.add_argument("--timeout", type=float, default=600, help="每个 NPU case 的秒数上限")
     flow.add_argument("--prepare-only", action="store_true", help="读取远端源码并生成 case，暂不运行 NPU case")
-    flow.add_argument("--allow-source-drift", action="store_true", help="允许远端源码不同于目标 tag；按实际远端源码生成并标注差异")
+    flow.add_argument("--resume", action="store_true", help="从同一 --output 的 workflow.json 继续，复用已完成的 AI 复核和用例")
     flow.add_argument("--dry-run", action="store_true", help="仅显示流程，不调用 AI、不连接远端")
     report = sub.add_parser("report", help="从 results/*.json 重建报告")
     report.add_argument("path", type=Path)
@@ -104,7 +103,7 @@ def main(argv=None):
             cases = select_cases(load_cases(args.path), args.kernel, args.case_name)
             if args.action == "list":
                 for case in cases:
-                    print(f"{case['kernel']} / {case['name']} [{case['mode']}] {case['wrapper']}")
+                    print(f"{case['kernel']} / {case['name']} {case['target']}")
             else:
                 print(f"PASS: {len(cases)} cases (structure only; semantic/NPU checks not performed)")
         elif args.command == "doctor":
@@ -133,7 +132,7 @@ def main(argv=None):
                 target = load_target(args.config, args.target)
                 return run_remote(target, cases, output, device=args.device or target.get("device", "npu:0"),
                                   warmup=args.warmup, rounds=args.rounds, timeout=args.timeout, dry_run=args.dry_run,
-                                  assets=args.assets, expected_identity=args.expected_source_fingerprint)
+                                  expected_identity=args.expected_source_fingerprint)
             if args.dry_run:
                 print(json.dumps({"cases": [f"{c['kernel']}/{c['name']}" for c in cases],
                                   "cwd": str(args.cwd.resolve()), "device": args.device or "npu:0",
@@ -143,20 +142,23 @@ def main(argv=None):
                 return run_suite(cases, cwd=args.cwd, output=output, device=args.device or "npu:0",
                                  warmup=args.warmup, rounds=args.rounds, timeout=args.timeout,
                                  pythonpath=[p.resolve() for p in args.pythonpath], resume=args.resume,
-                                 assets=args.assets, expected_identity=args.expected_source_fingerprint)
+                                 expected_identity=args.expected_source_fingerprint)
         elif args.command == "scan":
             from .review import scan_with_ai
-            return scan_with_ai(args.repo, args.base, args.target, args.output, scope=args.scope,
+            from .runner import new_run_path
+            return scan_with_ai(args.repo, args.base, args.target, args.output or new_run_path("scans"), scope=args.scope,
                                 config=args.config, codex=args.codex, model=args.model, ai_timeout=args.ai_timeout)
         elif args.command == "pipeline":
             from .pipeline import pipeline
             from .runner import new_run_path
+            if args.resume and not args.output:
+                raise ValueError("pipeline --resume requires the original --output directory")
             return pipeline(args.repo, args.base, args.target, args.npu, args.config,
                             args.output or new_run_path(), scope=args.scope, codex=args.codex,
                             model=args.model, ai_timeout=args.ai_timeout, device=args.device,
                             warmup=args.warmup, rounds=args.rounds, timeout=args.timeout,
-                            prepare_only=args.prepare_only, allow_source_drift=args.allow_source_drift,
-                            dry_run=args.dry_run, cases_output=args.cases_output)
+                            prepare_only=args.prepare_only, dry_run=args.dry_run,
+                            cases_output=args.cases_output, resume=args.resume)
         elif args.command == "report":
             from .runner import render_report
             if not list((args.path / "results").glob("*.json")):

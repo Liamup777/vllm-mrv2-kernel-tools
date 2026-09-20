@@ -11,20 +11,30 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from kernel_tools.benchmark import resolve_wrapper
+from kernel_tools.benchmark import resolve_symbol, resolve_target
 from kernel_tools.cases import load_cases, select_cases, validate_cases
 from kernel_tools.common import save_json
 from kernel_tools.remote import safe_extract, target_command, run_remote
 from kernel_tools.runner import device_lock, run_suite
+from kernel_tools.runner import new_run_path
 from kernel_tools.scan import compare, scan
 
 
 def case(name="ok", kernel="test_kernel"):
-    return {"name": name, "kernel": kernel, "mode": "triton", "wrapper": "fixture:kernel",
+    return {"name": name, "kernel": kernel, "target": "fixture:kernel",
             "grid": [1], "arguments": {"x": {"shape": [3], "dtype": "int32", "initializer": "arange"}}}
 
 
 class CasesTest(unittest.TestCase):
+    def test_default_output_is_outside_current_repository(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+                os.environ, {"VLLM_KERNEL_TOOLS_HOME": str(Path(tmp) / "data")}):
+            output = new_run_path()
+            scan = new_run_path("scans")
+            self.assertTrue(output.is_relative_to((Path(tmp) / "data/runs").resolve()))
+            self.assertTrue(scan.is_relative_to((Path(tmp) / "data/scans").resolve()))
+            self.assertFalse(output.exists())
+
     def test_legacy_kwargs_jsonl_and_filter(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "cases.jsonl"
@@ -41,7 +51,7 @@ class CasesTest(unittest.TestCase):
             select_cases([case(), case(kernel="other")], case_name="ok")
         invalid = case()
         invalid["arguments"]["x"]["stride"] = [2]
-        with self.assertRaisesRegex(ValueError, "adapter"):
+        with self.assertRaisesRegex(ValueError, "materializer"):
             validate_cases([invalid])
 
     def test_pointer_contract_and_explicit_values(self):
@@ -63,14 +73,21 @@ class CasesTest(unittest.TestCase):
             file = Path(tmp) / "module with spaces.py"
             file.write_text("from __future__ import annotations\nfrom dataclasses import dataclass\n"
                             "@dataclass\nclass Value:\n    n: int\ndef launch():\n    return Value(7)\n")
-            self.assertEqual(resolve_wrapper(str(file) + ":launch")().n, 7)
+            self.assertEqual(resolve_symbol(str(file) + ":launch")().n, 7)
+
+    def test_triton_target_may_be_launchable_without_being_callable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            file = Path(tmp) / "launchable.py"
+            file.write_text("class Launchable:\n    def __getitem__(self, grid): return grid\nkernel = Launchable()\n")
+            target = resolve_target(str(file) + ":kernel")
+            self.assertEqual(target[(2,)], (2,))
 
 
 FAKE_WORKER = r'''
 import argparse, json, time
 from pathlib import Path
 p=argparse.ArgumentParser()
-for key in ('input-file','kernel','case-name','wrapper','mode','device','warmup','profiling-rounds','output'):
+for key in ('input-file','kernel','case-name','target','device','warmup','profiling-rounds','output'):
     p.add_argument('--'+key,required=True)
 a=p.parse_args()
 case=json.loads(Path(a.input_file).read_text())[0]
@@ -84,7 +101,7 @@ if a.case_name=='fail':
 if a.case_name=='wrong':
     Path(a.output).write_text(json.dumps({'error':{'phase':'correctness','reason':'AssertionError: output differs'}}))
     raise SystemExit(1)
-row={k:case[k] for k in ('name','kernel','wrapper','mode')}
+row={k:case[k] for k in ('name','kernel','target')}
 row.update(device=a.device,warmup=int(a.warmup),profiling_rounds=int(a.profiling_rounds),
            latencies_ms=[.01]*int(a.profiling_rounds),
            summary={k+'_ms':.01 for k in ('mean','p50','p90','p99','min','max')},
@@ -245,20 +262,15 @@ class TransportTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             venv.EnvBuilder(with_pip=False).create(root / "python")
-            assets = root / "adapters"
-            assets.mkdir()
-            (assets / "fixture_reference.py").write_text("def check(args, kwargs, output):\n    assert output == 1\n")
             target = {"host": "simulated", "cwd": str(root),
                       "python": str(root / "python/bin/python"), "result_root": str(root / "remote")}
             def local_wire(target, command):
                 return ["bash", "-c", command]
             with patch("kernel_tools.remote.ssh_command", side_effect=local_wire):
                 with contextlib.redirect_stdout(io.StringIO()):
-                    status = run_remote(target, [case()], root / "download", assets=assets)
+                    status = run_remote(target, [case()], root / "download")
             self.assertEqual(status, 1)
             self.assertTrue((root / "download/report.md").is_file())
-            self.assertEqual((root / "download/adapters/fixture_reference.py").read_text(),
-                             (assets / "fixture_reference.py").read_text())
             result = json.loads(next((root / "download/results").glob("*.json")).read_text())
             self.assertEqual(result["scenarios"][0]["status"], "blocked")
 

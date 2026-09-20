@@ -2,8 +2,6 @@
   {
     "name": "smoke_b1",
     "kernel": "_fill_num_accepted_kernel",
-    "mode": "triton",
-    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
     "grid": [
       1
     ],
@@ -32,13 +30,12 @@
         "initializer": "zeros"
       },
       "num_sampled": 1
-    }
+    },
+    "target": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel"
   },
   {
     "name": "typical_b32",
     "kernel": "_fill_num_accepted_kernel",
-    "mode": "triton",
-    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
     "grid": [
       32
     ],
@@ -67,13 +64,12 @@
         "initializer": "zeros"
       },
       "num_sampled": 1
-    }
+    },
+    "target": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel"
   },
   {
     "name": "sentinel_and_reordered_b3",
     "kernel": "_fill_num_accepted_kernel",
-    "mode": "triton",
-    "wrapper": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
     "grid": [
       3
     ],
@@ -107,6 +103,7 @@
         "initializer": "zeros"
       },
       "num_sampled": 1
-    }
+    },
+    "target": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel"
   }
 ]

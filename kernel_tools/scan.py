@@ -288,7 +288,7 @@ def compare(before, after):
             "requires_review": bool(after["unresolved_launches"] or after["parse_errors"] or after["unlaunched_jit"])}
 
 
-def write_scan(repo, base, target, output, scope="vllm/v1/worker/gpu"):
+def write_scan(repo, base, target, output, scope="vllm/v1/worker/gpu", *, announce=True):
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError(f"Scan output already exists: {output}")
@@ -311,5 +311,6 @@ def write_scan(repo, base, target, output, scope="vllm/v1/worker/gpu"):
     lines += ["## 未解决项", "", f"动态/未解析 launch：{len(after['unresolved_launches'])}；无已解析 launch 的 JIT：{len(after['unlaunched_jit'])}；解析失败：{len(after['parse_errors'])}。", "",
               "详细证据见 target.json。不要仅凭候选清单自动宣称新增算子已完整盘点。"]
     (output / "review.md").write_text("\n".join(lines) + "\n")
-    print(f"Scan: {output / 'review.md'}")
+    if announce:
+        print(f"Scan: {output / 'review.md'}")
     return delta

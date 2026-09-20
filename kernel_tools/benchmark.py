@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Benchmark one wrapper or raw Triton kernel with captured tensor inputs.
+"""Benchmark one raw Triton kernel with captured tensor inputs.
 
-The input may be a JSON object, a JSON array, or JSON Lines. The callable is
-provided separately as ``file.py:function``. NPU events measure every profiling
+The input may be a JSON object, a JSON array, or JSON Lines. The Triton target is
+provided separately as ``module:symbol`` or ``file.py:symbol``. NPU events measure every profiling
 round independently.
 """
 
@@ -76,17 +76,17 @@ def select_cases(
     return selected[:max_cases]
 
 
-def resolve_wrapper(path: str) -> Callable[..., Any]:
-    """Resolve ``file.py:function`` or ``module.path:function`` to a callable."""
+def resolve_symbol(path: str) -> Any:
+    """Resolve ``module:symbol`` or ``file.py:symbol`` without changing it."""
     if ":" not in path:
-        raise ValueError(f"Wrapper must use 'file.py:function' syntax, got: {path!r}")
+        raise ValueError(f"Target must use 'module:symbol' or 'file.py:symbol' syntax, got: {path!r}")
     source, attribute_path = path.rsplit(":", 1)
     source_path = Path(source)
     if source_path.suffix == ".py" or source_path.exists():
         source_path = source_path.expanduser().resolve()
         spec = importlib.util.spec_from_file_location(f"_operator_benchmark_{hashlib.sha256(str(source_path).encode()).hexdigest()[:16]}", source_path)
         if spec is None or spec.loader is None:
-            raise ImportError(f"Cannot import wrapper file: {source_path}")
+            raise ImportError(f"Cannot import target file: {source_path}")
         value: Any = importlib.util.module_from_spec(spec)
         # Dataclass decorators and recursive imports need this registration.
         sys.modules[spec.name] = value
@@ -95,9 +95,21 @@ def resolve_wrapper(path: str) -> Callable[..., Any]:
         value = importlib.import_module(source)
     for attribute in attribute_path.split("."):
         value = getattr(value, attribute)
-    if not callable(value):
-        raise TypeError(f"Resolved wrapper is not callable: {path}")
     return value
+
+
+def resolve_target(path: str) -> Any:
+    target = resolve_symbol(path)
+    if not hasattr(target, "__getitem__"):
+        raise TypeError(f"Resolved Triton target does not support kernel[grid]: {path}")
+    return target
+
+
+def resolve_checker(path: str) -> Any:
+    checker = resolve_symbol(path)
+    if not callable(checker):
+        raise TypeError(f"Resolved checker is not callable: {path}")
+    return checker
 
 
 def _resolve_dtype(name: str) -> torch.dtype:
@@ -208,20 +220,15 @@ def summarize(latencies_ms: Sequence[float]) -> dict[str, float]:
 
 def build_invoker(
     target: Any,
-    mode: str,
     grid: Any,
 ) -> Callable[[list[Any], dict[str, Any]], Any]:
-    """Build a regular wrapper call or a captured Triton grid launch."""
-    if mode == "wrapper":
-        return lambda args, kwargs: target(*args, **kwargs)
-    if mode != "triton":
-        raise ValueError(f"Unsupported benchmark mode: {mode}")
+    """Build a captured Triton grid launch."""
     if not isinstance(grid, list) or not grid or not all(isinstance(size, int) and size > 0 for size in grid):
-        raise ValueError(f"Triton mode requires a non-empty grid of positive integers, got: {grid!r}")
+        raise ValueError(f"Triton target requires a non-empty grid of positive integers, got: {grid!r}")
     try:
         launcher = target[tuple(grid)]
     except TypeError as error:
-        raise TypeError("Triton mode target must support kernel[grid](...) launches") from error
+        raise TypeError("Triton target must support kernel[grid](...) launches") from error
     return lambda args, kwargs: launcher(*args, **_normalize_triton_arguments(target, kwargs))
 
 
@@ -249,15 +256,15 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
     torch.manual_seed(case.get("seed", 0))
     torch.npu.manual_seed_all(case.get("seed", 0))
     PHASE = "import"
-    wrapper_path = case["wrapper"]
-    wrapper = resolve_wrapper(wrapper_path)
-    checker = resolve_wrapper(case["check"]) if case.get("check") else None
-    function = getattr(wrapper, "fn", wrapper)
+    target_path = case["target"]
+    target = resolve_target(target_path)
+    checker = resolve_checker(case["check"]) if case.get("check") else None
+    function = getattr(target, "fn", target)
     try:
         actual_file = str(Path(inspect.getfile(function)).resolve())
     except (TypeError, OSError):
         actual_file = None
-    binding = {"target": wrapper_path, "module": getattr(function, "__module__", None),
+    binding = {"target": target_path, "module": getattr(function, "__module__", None),
                "file": actual_file}
     if actual_file and Path(actual_file).is_file():
         binding["file_sha256"] = hashlib.sha256(Path(actual_file).read_bytes()).hexdigest()
@@ -265,7 +272,7 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
     keepalive: list[torch.Tensor] = []
     args = materialize(case.get("args", []), device, keepalive)
     kwargs = materialize(case.get("arguments", case.get("kwargs", {})), device, keepalive)
-    invoke = build_invoker(wrapper, case["mode"], case.get("grid"))
+    invoke = build_invoker(target, case.get("grid"))
     # Preserve pointer-table pointees too. Never replace allocations or addresses.
     backups = [(tensor, tensor.clone()) for tensor in keepalive] if case.get("reset_inputs") else []
 
@@ -304,19 +311,18 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
         events.append((start, end))
     torch.npu.synchronize()
     latencies_ms = [start.elapsed_time(end) for start, end in events]
-    return {"name": case["name"], "wrapper": wrapper_path, "mode": case["mode"],
+    return {"name": case["name"], "target": target_path,
             "kernel": case["kernel"], "grid": case.get("grid"), "device": device,
             "warmup": warmup, "profiling_rounds": rounds, "binding": binding,
             "correctness": correctness, "seed": case.get("seed", 0),
-            "benchmark_scope": case.get("benchmark_scope", (
-                "launch only; input reset and check excluded" if case["mode"] == "triton" else
-                "wrapper callable; internal allocation/construction included; external reset/check excluded")),
+            "benchmark_scope": case.get("benchmark_scope",
+                "Triton launch only; input reset and check excluded"),
             "latencies_ms": latencies_ms, "summary": summarize(latencies_ms)}
 
 
 def _override(case: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     case = dict(case)
-    for key in ("wrapper", "mode", "device", "warmup", "profiling_rounds"):
+    for key in ("target", "device", "warmup", "profiling_rounds"):
         value = getattr(args, key)
         if value is not None:
             case[key] = value
@@ -343,8 +349,7 @@ def _replace_tensor_devices(value: Any, device: str) -> Any:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-file", type=Path, required=True)
-    parser.add_argument("--wrapper", required=True, help="Wrapper or Triton kernel (file.py:function)")
-    parser.add_argument("--mode", choices=("wrapper", "triton"), default="wrapper")
+    parser.add_argument("--target", required=True, help="Triton kernel (module:symbol or file.py:symbol)")
     parser.add_argument("--kernel", help="Select this kernel from a mixed captured input file")
     parser.add_argument("--case-name", help="Select one named case after kernel filtering")
     parser.add_argument("--max-cases", type=int, help="Benchmark only the first N selected input records")

@@ -8,6 +8,12 @@ import tarfile
 from pathlib import Path
 
 
+# vLLM generates this ignored file through vcs-versioning/setuptools-scm.  It is
+# installation metadata, not tag-controlled kernel source, and can legitimately
+# retain the version of the last editable install after the checkout changes.
+GENERATED_SOURCE_FILES = {"vllm/_version.py"}
+
+
 def source_files(info):
     files = {}
     for name in ("vllm", "vllm_ascend"):
@@ -17,7 +23,9 @@ def source_files(info):
         root = Path(origin).resolve().parent
         for file in sorted(root.rglob("*.py")):
             if file.is_file() and not file.is_symlink() and "__pycache__" not in file.parts:
-                files[name + "/" + file.relative_to(root).as_posix()] = file.read_bytes()
+                relative = name + "/" + file.relative_to(root).as_posix()
+                if relative not in GENERATED_SOURCE_FILES:
+                    files[relative] = file.read_bytes()
     return files
 
 

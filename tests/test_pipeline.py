@@ -13,7 +13,7 @@ from kernel_tools.ai import CASE_SCHEMA, DIAGNOSIS_SCHEMA, REVIEW_SCHEMA, Codex
 from kernel_tools.common import save_json
 from kernel_tools.pipeline import pipeline, validate_bundle
 from kernel_tools.remote import fetch_snapshot
-from kernel_tools.snapshot import source_identity
+from kernel_tools.snapshot import source_files, source_identity
 
 
 SOURCE = """import triton
@@ -31,10 +31,9 @@ MODULE = "kt_generated_" + hashlib.sha256(IDENTITY.encode()).hexdigest()[:16]
 def generated():
     # Protocol fixture, not a real kernel correctness test.
     return {"status": "ready", "reason": "", "analysis": "Protocol fixture, x is a scalar",
-            "adapter_source": "def check(args, kwargs, output):\n    assert kwargs['x'] == 1\n",
             "cases_json": json.dumps([{"name": "smoke", "kernel": "added", "scenario": "protocol",
-                "mode": "triton", "wrapper": "vllm.v1.worker.gpu.new:added", "grid": [1],
-                "arguments": {"x": 1}, "check": MODULE + ":check"}])}
+                "target": "vllm.v1.worker.gpu.new:added", "grid": [1],
+                "arguments": {"x": 1}}])}
 
 
 class FakeAI:
@@ -99,7 +98,6 @@ class PipelineTest(unittest.TestCase):
 
     def execute(self, target, cases, output, **kwargs):
         self.assertTrue(kwargs["expected_identity"])
-        self.assertTrue((kwargs["assets"] / (MODULE + ".py")).is_file())
         output.mkdir()
         save_json(output / "results/added.json", {"kernel": "added", "scenarios": [
             {"name": c["name"], "status": "success", "correctness": "passed"} for c in cases]})
@@ -122,7 +120,7 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(len(self.ai.calls), 2)
         self.assertIn("Apply this skill", self.ai.calls[0][0])
         self.assertEqual({p.name for p in self.output.iterdir()},
-                         {"cases", "adapters", "results", "workflow.json", "report.md"})
+                         {"cases", "results", "workflow.json", "report.md"})
 
     def test_missing_candidate_blocks_before_ssh(self):
         self.ai.omit = True
@@ -147,6 +145,46 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(self.run_flow(prepare_only=True), 0)
             remote.assert_not_called()
         self.assertEqual(self.state()["status"], "prepared")
+
+    def test_resume_reuses_review_and_generated_cases(self):
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
+             patch("kernel_tools.pipeline.run_remote") as remote:
+            self.assertEqual(self.run_flow(prepare_only=True), 0)
+            remote.assert_not_called()
+        self.assertEqual(len(self.ai.calls), 2)
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
+             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+            self.assertEqual(self.run_flow(resume=True), 0)
+        self.assertEqual(len(self.ai.calls), 2)
+        self.assertEqual(self.state()["status"], "completed")
+        self.assertTrue(self.state()["resumes"])
+
+    def test_resume_rechecks_review_when_scope_policy_changed(self):
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
+             patch("kernel_tools.pipeline.run_remote") as remote:
+            self.assertEqual(self.run_flow(prepare_only=True), 0)
+            remote.assert_not_called()
+        state = self.state()
+        state.pop("review_policy_version")
+        save_json(self.output / "workflow.json", state)
+        calls = len(self.ai.calls)
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
+             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+            self.assertEqual(self.run_flow(resume=True), 0)
+        self.assertEqual(len(self.ai.calls), calls + 1)
+
+    def test_resume_after_remote_source_is_aligned_reuses_review(self):
+        def drift(*args, **kwargs):
+            value = self.snapshot(*args, **kwargs)
+            value["identity"]["files"][PATH] = "different"
+            return value
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=drift):
+            self.assertEqual(self.run_flow(), 1)
+        self.assertEqual(len(self.ai.calls), 1)
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
+             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+            self.assertEqual(self.run_flow(resume=True), 0)
+        self.assertEqual(len(self.ai.calls), 2)
 
     def test_custom_case_directory_is_saved_and_reported(self):
         case_dir = self.root / "generated-cases"
@@ -221,18 +259,28 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(self.run_flow(), 1)
         self.assertIn("exactly the generated cases", self.state()["error"])
 
-    def test_reference_required_and_wrapper_must_exist(self):
+    def test_target_must_exist_and_generated_checker_is_rejected(self):
         bundle = generated()
         cases = json.loads(bundle["cases_json"])
-        cases[0].pop("check")
+        cases[0]["check"] = "generated_reference:check"
         bundle["cases_json"] = json.dumps(cases)
-        with self.assertRaisesRegex(ValueError, "checker"):
-            validate_bundle(bundle, OPERATOR, MODULE, {PATH: SOURCE})
+        with self.assertRaisesRegex(ValueError, "built into the framework"):
+            validate_bundle(bundle, OPERATOR, {PATH: SOURCE})
         with self.assertRaisesRegex(ValueError, "absent"):
-            validate_bundle(generated(), OPERATOR, MODULE, {})
+            validate_bundle(generated(), OPERATOR, {})
 
 
 class CodexProtocolTest(unittest.TestCase):
+    def test_snapshot_excludes_vllm_generated_version_file_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp) / "vllm"
+            package.mkdir()
+            (package / "__init__.py").write_text("# tracked\n")
+            (package / "_version.py").write_text("# generated by vcs-versioning\n")
+            (package / "extra.py").write_text("# must remain visible\n")
+            files = source_files({"imports": {"vllm": str(package / "__init__.py")}})
+        self.assertEqual(set(files), {"vllm/__init__.py", "vllm/extra.py"})
+
     def test_real_subprocess_protocol_and_failure_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

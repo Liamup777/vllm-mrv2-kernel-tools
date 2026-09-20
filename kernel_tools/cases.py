@@ -37,21 +37,20 @@ def validate_cases(cases):
     seen = set()
     for case in cases:
         label = f"{case.get('kernel', '?')}/{case.get('name', '?')}"
-        for key in ("name", "kernel", "wrapper", "mode"):
+        for key in ("name", "kernel", "target"):
             if not isinstance(case.get(key), str) or not case[key].strip():
                 raise ValueError(f"{label}: requires nonempty '{key}'")
         identity = (case["kernel"], case["name"])
         if identity in seen:
             raise ValueError(f"Duplicate case: {label}")
         seen.add(identity)
-        if case["mode"] not in ("triton", "wrapper"):
-            raise ValueError(f"{label}: mode must be triton or wrapper")
-        if ":" not in case["wrapper"]:
-            raise ValueError(f"{label}: wrapper must be module:symbol or file.py:symbol")
-        if case["mode"] == "triton":
-            grid = case.get("grid")
-            if not isinstance(grid, list) or not grid or any(type(x) is not int or x <= 0 for x in grid):
-                raise ValueError(f"{label}: grid must contain positive integers")
+        if ":" not in case["target"]:
+            raise ValueError(f"{label}: target must be module:symbol or file.py:symbol")
+        if "mode" in case or "wrapper" in case:
+            raise ValueError(f"{label}: legacy mode/wrapper fields are unsupported; use a direct Triton target")
+        grid = case.get("grid")
+        if not isinstance(grid, list) or not grid or any(type(x) is not int or x <= 0 for x in grid):
+            raise ValueError(f"{label}: grid must contain positive integers")
         if "kwargs" in case and "arguments" in case:
             raise ValueError(f"{label}: use arguments or legacy kwargs, not both")
         if not isinstance(case.get("arguments", case.get("kwargs", {})), dict):
@@ -73,7 +72,7 @@ def validate_value(value, label):
     if isinstance(value, dict) and "shape" in value:
         unknown = value.keys() - TENSOR_KEYS
         if unknown:
-            raise ValueError(f"{label}: unsupported tensor fields {sorted(unknown)}; use an adapter")
+            raise ValueError(f"{label}: unsupported tensor fields {sorted(unknown)}; extend the framework materializer")
         shape = value["shape"]
         if not isinstance(shape, list) or any(type(n) is not int or n < 0 for n in shape):
             raise ValueError(f"{label}: invalid tensor shape")

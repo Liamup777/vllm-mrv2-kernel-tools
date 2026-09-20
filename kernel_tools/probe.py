@@ -25,6 +25,25 @@ def environment(device=None):
             info["imports"][name] = spec.origin if spec else None
         except (ValueError, ImportError) as error:
             info["imports"][name] = str(error)
+    info["source_revisions"] = {}
+    for name in ("vllm", "vllm_ascend"):
+        origin = info["imports"].get(name)
+        if not origin or not Path(origin).is_file() or not shutil.which("git"):
+            continue
+        try:
+            root = subprocess.run(["git", "-C", str(Path(origin).parent), "rev-parse", "--show-toplevel"],
+                                  text=True, capture_output=True, timeout=5, check=True).stdout.strip()
+            def git(*args):
+                return subprocess.run(["git", "-C", root, *args], text=True, capture_output=True,
+                                      timeout=5, check=True).stdout.strip()
+            info["source_revisions"][name] = {
+                "root": root, "head": git("rev-parse", "HEAD"),
+                "branch": git("branch", "--show-current"),
+                "describe": git("describe", "--tags", "--always", "--dirty"),
+                "dirty": bool(git("status", "--porcelain")),
+            }
+        except (OSError, subprocess.SubprocessError):
+            pass
     cann_root = Path(os.environ.get("ASCEND_HOME_PATH", "/usr/local/Ascend/ascend-toolkit/latest"))
     info["cann"] = {"root": str(cann_root), "version": None}
     for path in [cann_root / "version.cfg", cann_root / "aarch64-linux/ascend_toolkit_install.info",

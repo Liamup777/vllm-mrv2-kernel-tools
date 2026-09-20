@@ -3,7 +3,7 @@
 一个用于 vLLM MRV2 Triton 版本检查和 Ascend 单算子测试的小工具。
 
 - 一条 `pipeline` 命令串联版本扫描、Codex/skill 用例生成、NPU 执行和失败分析。
-- 保留 `kernel_test_frame` 的 JSON/JSONL case、raw Triton / wrapper 两种执行方式。
+- 使用 JSON/JSONL case 直接执行 `kernel[grid](...)`，只测 Triton kernel 本体。
 - 一条命令按算子或 case 筛选、运行、汇总；失败保存完整日志。
 - 从指定 Git tag 扫描静态候选并比较版本，不切换被测仓库的分支。
 - 控制端只需 Python 3.10+；NPU 执行端使用已有 Torch / torch_npu / Triton / CANN 环境。
@@ -17,7 +17,9 @@ python3 -m kernel_tools pipeline --repo ../vllm \
 
 首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划；加 `--prepare-only` 会调用 AI 并读取远端源码，生成用例后停止。默认使用本机 Codex 模型配置；`--model` 可覆盖。详见 [完整流程说明](docs/pipeline.md)。
 
-生成的用例默认保存在本次运行目录的 `cases/` 中；使用 `--cases-output cases/v0.29.0` 可指定独立目录。`--output` 仍指定整次运行的报告目录。
+运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。中断或前置检查阻塞后，用相同命令和输出目录追加 `--resume`；已完成的 AI 复核与源码指纹一致的 case 会被复用。
+
+生成的用例默认保存在本次运行目录的 `cases/` 中；使用 `--cases-output ~/vllm-kernel-cases/v0.29.0` 可指定独立目录。`--output` 仍指定整次运行的报告目录。未设置输出目录时，macOS 默认写入 `~/Library/Application Support/vllm-kernel-tools/`，不会在工具仓库生成运行文件；其他系统使用各自的用户数据目录。可通过 `VLLM_KERNEL_TOOLS_HOME` 改写根目录。
 
 `scan` 通过 `codex exec` 调用 AI 和 release-scan skill 核实新增算子；`pipeline` 在相同扫描阶段后继续生成用例和运行测试。新增算子有无法确定的输入或 reference 时，报告 blocked 并继续其他算子。
 
@@ -61,7 +63,7 @@ python -m kernel_tools run examples/fill_num_accepted.json \
   --target npu160 --output artifacts/fill-all
 ```
 
-工具自动上传自身和 case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。自定义 adapter/checker 可通过 `--assets DIRECTORY` 随用例上传和保留，也可预先放在远端 `pythonpath` 中；不会上传生产源码。
+工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造和可选 reference 由统一测试框架提供，自动流程不生成辅助 Python 文件。
 
 查看计划而不连接远端：
 
@@ -94,7 +96,6 @@ python -m kernel_tools run examples/fill_num_accepted.json \
 ```text
 artifacts/fill-all/
   cases/       # 真正执行的 case，每个算子一份
-  adapters/    # 使用 --assets 时保留输入构造/reference
   results/     # 每个算子的所有场景结果和实际绑定
   logs/        # 仅失败场景的完整日志
   report.md    # 场景结果、耗时、失败原因与日志链接
@@ -107,14 +108,14 @@ artifacts/fill-all/
 ```bash
 python -m kernel_tools scan --repo ../vllm \
   --base v0.28.0 --target v0.29.0 \
-  --output artifacts/releases/v0.28.0--v0.29.0
+  --output ~/vllm-kernel-tools-output/v0.28.0--v0.29.0
 ```
 
 `scan` 自动调用 Codex 和 release-scan skill，只分析源码，不连接 NPU。控制端需要可用且已登录的 Codex CLI；可读取 `kernel-tools.json` 的 `ai.codex`，无需配置 NPU 目标。
 
 输出 `review.md` 和 `review.json`。报告分别列出 AI 确认新增、待核实和已有/非新增项，不把已有算子的变化混入新增数。静态 AST 候选只作为内部辅助；读取精确 tag，不切换源码分支。
 
-AI 会检查动态调用、继承和外部 wrapper，但复核仍可能遗漏。报告不是全覆盖证明，也不是 NPU 数值正确性或性能报告。AI 失败时明确记录失败及日志，不退回静态结果冒充复核完成。
+AI 会检查别名和显式导入的外部 Triton kernel，但复核仍可能遗漏。报告不是全覆盖证明，也不是 NPU 数值正确性或性能报告。AI 失败时明确记录失败及日志，不退回静态结果冒充复核完成。
 
 扫描的具体实现和 AI 参与的边界见 [扫描原理与手动流程](docs/scanning.md)。
 

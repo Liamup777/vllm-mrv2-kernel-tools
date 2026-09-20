@@ -12,6 +12,9 @@ from .common import save_json
 from .scan import Module, tagged_sources, write_scan
 
 
+REVIEW_POLICY_VERSION = 2
+
+
 def resource_root():
     for root in (Path(__file__).resolve().parent.parent, Path(sys.prefix) / "share/vllm-kernel-tools"):
         if (root / "skills/vllm-triton-release-scan/SKILL.md").is_file():
@@ -68,21 +71,22 @@ def validate_review(review, delta, target_sources, before):
 def review_sources(ai, delta, target_sources, before, workspace, failure_log):
     task = (
         f"Scan scope: {before['scope']}. Read exact source snapshots base/ and target/. "
-        "The scope is MRV2 framework kernels: worker input/block-table preparation, sampling, "
-        "speculative decoding and model-state management, including external operator wrappers "
-        "explicitly called for those duties (e.g. a Mamba context's copy/postprocess methods). "
-        "Treat generic model loading/registries, model.forward/__call__, attention backend execution "
-        "and arbitrary PyTorch dispatch as boundaries: do not expand them into all architecture, "
-        "attention, MoE, quantization or vendor backend kernels. An explicit MRV2 operator call "
-        "must justify an external candidate, not merely that a model could run on the worker. "
+        "The scope is strict: (1) Triton kernels defined under the requested GPU directory and "
+        "directly launched, and (2) external Triton JIT kernels whose symbol is explicitly "
+        "imported by a module under that directory and directly launched with kernel[grid](...) in that importing "
+        "module. Calling an imported Python wrapper does not qualify. For an external operator, cite both the import statement and direct launch. Do not "
+        "follow instance methods, typed context objects, interfaces, inheritance, returned objects, "
+        "metadata implementations, registries, backend dispatch or model-specific state methods to "
+        "discover external kernels. Importing a class and calling its method does not count as "
+        "directly importing a Triton operator. "
         "Use scan/base.json, scan/target.json and scan/delta.json only as candidate hints; "
         "the AST scanner is incomplete and can misclassify ordinary Python subscript calls. "
         "Independently inspect source changes, imports, typed/returned objects and their methods, "
-        "inheritance and direct kernel[grid](...) launch sites to find newly introduced launchable "
-        "Triton operators reachable from the scope. Distinguish new implementation from a new MRV2 "
+        "aliases and direct kernel[grid](...) launch sites to find newly introduced launchable "
+        "Triton operators inside this boundary. Distinguish new implementation from a new MRV2 "
         "call path to a preexisting operator, moved/renamed code, helper-only JIT and existing modified kernels. "
         "Account for EVERY delta.added and moved_or_renamed target with new/not_new/needs_review. "
-        "Add missed operators if supported by source, including imported external wrappers. "
+        "Add missed operators only when they meet the local-definition or explicit-import boundary. "
         "For each operator, id is the fully qualified Python function, definition is the relative "
         "source file path and kernel is its function name. Evidence must cite definition and direct "
         "launch path:line, wrapper/call path and activation condition; compare against base to explain "
@@ -95,7 +99,8 @@ def review_sources(ai, delta, target_sources, before, workspace, failure_log):
         "This stage only reviews source; do not generate cases, run NPU jobs or recursively invoke "
         "kernel-tools scan/pipeline. Return the schema JSON, no XLSX is required here.")
     result = ai.ask(instructions("vllm-triton-release-scan", task), REVIEW_SCHEMA,
-                    workspace=workspace, failure_log=failure_log)
+                    workspace=workspace, failure_log=failure_log,
+                    label="release review (vllm-triton-release-scan)")
     validate_review(result, delta, target_sources, before)
     return result
 
@@ -136,14 +141,15 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
     document = {"schema_version": 1, "status": "running", "scope": scope,
                 "base": {"tag": base, "commit": None}, "target": {"tag": target, "commit": None},
                 "validation": "ai_source_review", "complete_inventory": False,
-                "runtime_coverage": "not_checked", "model": model or "Codex configured default"}
+                "runtime_coverage": "not_checked", "review_policy_version": REVIEW_POLICY_VERSION,
+                "model": model or "Codex configured default"}
     render_review(root, document)
     try:
         ai = ai_client or Codex(resolve_codex(config, codex), model, ai_timeout)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-review-") as tmp:
             workspace = Path(tmp)
             print("[scan] Preparing exact tag sources and candidate hints", flush=True)
-            delta = write_scan(repo, base, target, workspace / "scan", scope)
+            delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
             before = json.loads((workspace / "scan/base.json").read_text())
             write_sources(repo, base, workspace / "base")
             _, sources = write_sources(repo, target, workspace / "target")

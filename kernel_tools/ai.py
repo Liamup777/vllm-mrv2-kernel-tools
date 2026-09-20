@@ -8,6 +8,8 @@ import shutil
 import signal
 import subprocess
 import tempfile
+import time
+import tomllib
 from pathlib import Path
 
 
@@ -26,8 +28,24 @@ REVIEW_SCHEMA = object_schema({
     "summary": STRING})
 CASE_SCHEMA = object_schema({
     "status": {"type": "string", "enum": ["ready", "blocked"]},
-    "reason": STRING, "analysis": STRING, "cases_json": STRING, "adapter_source": STRING})
+    "reason": STRING, "analysis": STRING, "cases_json": STRING})
 DIAGNOSIS_SCHEMA = object_schema({"analysis": STRING})
+
+
+def describe_codex(executable, model=None, timeout=1800):
+    configured = {}
+    config = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
+    try:
+        configured = tomllib.loads(config.read_text()) if config.is_file() else {}
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    return {
+        "executable": str(executable),
+        "model": model or configured.get("model") or "Codex configured default",
+        "model_source": "command line" if model else "Codex config",
+        "reasoning_effort": configured.get("model_reasoning_effort") if not model else None,
+        "timeout_seconds": timeout,
+    }
 
 
 def resolve_codex(config=None, executable=None):
@@ -72,7 +90,11 @@ class Codex:
             raise ValueError("AI timeout must be finite and positive")
         self.model, self.timeout = model, timeout
 
-    def ask(self, prompt, schema, *, workspace, failure_log):
+    def description(self):
+        """Return the effective user-visible AI settings without invoking Codex."""
+        return describe_codex(self.executable, self.model, self.timeout)
+
+    def ask(self, prompt, schema, *, workspace, failure_log, label="AI task"):
         """Retain full failed CLI output, discard successful event chatter."""
         failure_log = Path(failure_log)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-ai-") as tmp:
@@ -86,16 +108,31 @@ class Codex:
             if self.model:
                 command += ["--model", self.model]
             command += ["-"]
+            shown_model = self.description()["model"]
+            print(f"[ai] start: {label}; model={shown_model}; prompt={len(prompt)} chars; "
+                  f"timeout={self.timeout:g}s", flush=True)
+            started = time.monotonic()
             try:
                 with capture.open("wb") as stream:
                     process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=stream,
                                                stderr=subprocess.STDOUT, start_new_session=True)
                     try:
-                        process.communicate(prompt.encode(), timeout=self.timeout)
+                        process.stdin.write(prompt.encode())
+                        process.stdin.close()
+                        next_notice = started + 30
+                        while process.poll() is None:
+                            now = time.monotonic()
+                            if now - started >= self.timeout:
+                                raise subprocess.TimeoutExpired(command, self.timeout)
+                            if now >= next_notice:
+                                print(f"[ai] running: {label}; elapsed={int(now - started)}s", flush=True)
+                                next_notice = now + 30
+                            time.sleep(min(1, max(0.05, self.timeout - (now - started))))
                     except (subprocess.TimeoutExpired, KeyboardInterrupt):
                         os.killpg(process.pid, signal.SIGKILL)
-                        process.communicate()
+                        process.wait()
                         raise
+                print(f"[ai] finished: {label}; elapsed={int(time.monotonic() - started)}s", flush=True)
                 if process.returncode:
                     with capture.open("rb") as stream:
                         stream.seek(max(0, capture.stat().st_size - 32000))

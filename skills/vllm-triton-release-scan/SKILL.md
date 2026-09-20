@@ -1,15 +1,15 @@
 ---
 name: vllm-triton-release-scan
-description: Review vLLM MRV2 Triton operators at exact tags, verify direct launch and wrapper evidence, and explain release differences using kernel-tools scan output. Static candidates need review before a complete inventory is claimed.
+description: Review vLLM MRV2 Triton operators at exact tags, verify direct kernel launch evidence, and explain release differences using kernel-tools scan output. Static candidates need review before a complete inventory is claimed.
 ---
 
 # Release review
 
 The `scan` CLI invokes Codex with this skill; `pipeline` invokes the same review stage before case generation. Read the supplied exact source snapshots and internal static candidate files. Do not recursively invoke scan or pipeline from this stage. Static candidates are hints, not a complete inventory or proof of runtime reachability.
 
-Inspect the exact tag commits recorded in the output. Include directly launched `kernel[grid](...)` functions reached from `vllm/v1/worker/gpu`, including imported wrappers outside the directory. Exclude JIT-only helpers from the operator count. Verify unresolved launches, dynamic aliases, inheritance, conditional backend choices and monkey patches against source. A move/rename candidate is not a new operator merely because its path changed.
+Inspect the exact tag commits recorded in the output. Include directly launched `kernel[grid](...)` functions defined under `vllm/v1/worker/gpu`. Also include an external Triton JIT kernel only when a module under that directory explicitly imports that symbol and directly launches it with `kernel[grid](...)`. Calling an imported Python wrapper does not qualify. Exclude JIT-only helpers from the operator count. A move/rename candidate is not a new operator merely because its path changed.
 
-Scope means MRV2 framework operations: input/block-table preparation, sampling, speculative decoding and model-state management, including explicitly called external operator wrappers and context methods. Stop at generic model loading/registries, model.forward/__call__, attention-backend execution and arbitrary PyTorch dispatch. Do not expand those generic entry points into an inventory of every architecture, attention, MoE or quantization kernel. External inclusion needs a concrete MRV2 framework operation path, such as the Mamba state's context copy methods, rather than only model execution reachability.
+Do not expand the scope by resolving instance methods, typed context objects, interfaces, inheritance, metadata implementations, registries, backend dispatch, model.forward/__call__ or model-specific state methods outside the directory. Importing a class and calling one of its methods does not count as importing and directly using a Triton operator. For every external inclusion, cite the explicit import statement and the direct call or launch in the importing GPU-directory module.
 
 For each verified operator retain definition, direct launch site, wrapper, worker entry path, activation condition and exact source version. Inspect changed wrappers and transitive helpers even when the kernel body is unchanged. Unverified paths remain unresolved.
 

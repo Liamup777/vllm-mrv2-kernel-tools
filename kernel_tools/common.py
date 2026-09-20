@@ -5,6 +5,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -43,3 +44,15 @@ def source_snapshot(path):
                 "dirty": bool(git(path, "status", "--porcelain"))}
     except ValueError:
         return {"path": str(path), "head": None, "dirty": None}
+
+
+def user_data_root():
+    """Persistent generated artifacts, kept outside the installed/source tree."""
+    override = os.environ.get("VLLM_KERNEL_TOOLS_HOME")
+    if override:
+        return Path(override).expanduser().resolve()
+    if sys.platform == "darwin":
+        return Path.home() / "Library/Application Support/vllm-kernel-tools"
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "vllm-kernel-tools"
+    return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "vllm-kernel-tools"

@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
-from .common import digest, file_key, save_json, source_snapshot
+from .common import digest, file_key, save_json, source_snapshot, user_data_root
 
 METRICS = ("mean", "p50", "p90", "p99", "min", "max")
 
@@ -79,7 +79,7 @@ def validate_result(data, case, device, warmup, rounds):
     if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
         raise ValueError("worker must return exactly one result")
     row = data[0]
-    for key, expected in {**{k: case[k] for k in ("name", "kernel", "wrapper", "mode")},
+    for key, expected in {**{k: case[k] for k in ("name", "kernel", "target")},
                           "device": device, "warmup": warmup, "profiling_rounds": rounds}.items():
         if row.get(key) != expected:
             raise ValueError(f"worker result identity mismatch: {key}")
@@ -103,8 +103,8 @@ def run_one(case, cwd, env, device, warmup, rounds, timeout, log_path, worker_co
         save_json(input_path, [case])
         command = worker_command or [sys.executable, "-m", "kernel_tools.benchmark"]
         command = [*command, "--input-file", str(input_path), "--kernel", case["kernel"],
-                   "--case-name", case["name"], "--wrapper", case["wrapper"],
-                   "--mode", case["mode"], "--device", device,
+                   "--case-name", case["name"], "--target", case["target"],
+                   "--device", device,
                    "--warmup", str(warmup), "--profiling-rounds", str(rounds), "--output", str(output)]
         capture = Path(tmp) / "process.log"
         phase, reason = "unknown", "case process failed"
@@ -190,7 +190,7 @@ def render_report(root):
 
 
 def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, timeout=600,
-              pythonpath=(), resume=False, probe_info=None, worker_command=None, assets=None,
+              pythonpath=(), resume=False, probe_info=None, worker_command=None,
               expected_identity=None):
     if warmup < 0 or rounds < 1 or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("Require warmup >= 0, rounds > 0 and a finite positive timeout")
@@ -199,9 +199,7 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
     cwd, output = Path(cwd).resolve(), Path(output).resolve()
     if not cwd.is_dir():
         raise ValueError(f"Working directory not found: {cwd}")
-    from .remote import asset_files
-    packaged_assets = asset_files(assets)
-    env = runtime_env(cwd, ([Path(assets).resolve()] if assets else []) + list(pythonpath))
+    env = runtime_env(cwd, list(pythonpath))
     try:
         info = probe_info if probe_info is not None else probe(cwd, env, device)
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
@@ -228,20 +226,12 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
                "visible_devices": env.get("ASCEND_RT_VISIBLE_DEVICES", "all"),
                "isolation": "cooperative_lock_only"}
     tool_hash = digest({p.name: p.read_text() for p in Path(__file__).parent.glob("*.py")})
-    signature = digest({"cases": cases, "context": context, "tool_hash": tool_hash,
-                        "assets": {str(p): f.read_text() for f, p in packaged_assets}})
+    signature = digest({"cases": cases, "context": context, "tool_hash": tool_hash})
     if resume and any(s["dirty"] is not False for s in [*sources, *imported_sources.values()]):
         raise ValueError("Resume requires clean Git source roots; start a new output directory for dirty/unversioned sources")
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output already exists: {output}; choose a new path or use --resume")
     output.mkdir(parents=True, exist_ok=True)
-    if packaged_assets:
-        import shutil
-        for file, relative in packaged_assets:
-            destination = output / "adapters" / relative
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            if file.resolve() != destination.resolve():
-                shutil.copyfile(file, destination)
     grouped = {}
     for case in cases:
         grouped.setdefault(case["kernel"], []).append(case)
@@ -306,5 +296,5 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
     return 0 if all(r["status"] == "success" for d in documents.values() for r in d["scenarios"]) else 1
 
 
-def new_run_path():
-    return Path("artifacts/runs") / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6])
+def new_run_path(kind="runs"):
+    return user_data_root() / kind / (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6])

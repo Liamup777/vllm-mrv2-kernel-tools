@@ -106,35 +106,12 @@ def fetch_snapshot(target, destination, *, device="npu:0", failure_log=None):
             raise ValueError(f"Remote source snapshot failed: {error}") from error
 
 
-def asset_files(root):
-    if root is None:
-        return []
-    root = Path(root).resolve()
-    if not root.is_dir():
-        raise ValueError(f"Adapter directory not found: {root}")
-    files = []
-    for file in sorted(root.rglob("*")):
-        relative = file.relative_to(root)
-        if "__pycache__" in relative.parts:
-            continue
-        if file.is_symlink():
-            raise ValueError("Adapter assets cannot contain symlinks")
-        if file.is_file():
-            if file.suffix != ".py" or any(not p.isidentifier() for p in (*relative.parts[:-1], file.stem)):
-                raise ValueError("Adapter assets must be importable Python modules/packages")
-            if relative.parts[0] == "kernel_tools" or file.stem == "kernel_tools":
-                raise ValueError("Adapter assets cannot replace kernel_tools")
-            files.append((file, relative))
-    return files
-
-
 def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
-               timeout=600, dry_run=False, doctor=False, assets=None, expected_identity=None):
+               timeout=600, dry_run=False, doctor=False, expected_identity=None):
     output = Path(output).resolve()
     if not doctor and output.exists() and any(output.iterdir()):
         raise ValueError(f"Output already exists: {output}")
     token = uuid.uuid4().hex
-    packaged_assets = asset_files(assets)
     stage = "/tmp/kernel-tools-" + token
     remote_output = target["result_root"].rstrip("/") + "/" + output.name + "-" + token[:6]
     argv = [target["python"], "-m", "kernel_tools"]
@@ -145,8 +122,6 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
                  "--device", device, "--warmup", str(warmup), "--rounds", str(rounds), "--timeout", str(timeout)]
         for path in target.get("pythonpath", []):
             argv += ["--pythonpath", path]
-        if packaged_assets:
-            argv += ["--assets", stage + "/adapters"]
         if expected_identity:
             argv += ["--expected-source-fingerprint", expected_identity]
     command = target_command(target, argv, tool_root=stage)
@@ -165,8 +140,6 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
                 for source in sorted(Path(__file__).parent.glob("*.py")):
                     tar.add(source, arcname="kernel_tools/" + source.name)
                 tar.add(payload, arcname="input.json")
-                for source, relative in packaged_assets:
-                    tar.add(source, arcname="adapters/" + relative.as_posix())
             checked_ssh(target, shlex.join(["mkdir", "-p", stage]))
             staged = True
             with bundle.open("rb") as file:

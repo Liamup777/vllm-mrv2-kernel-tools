@@ -1,7 +1,6 @@
 """Scan → AI review/cases → deterministic remote run → evidence-based report."""
 from __future__ import annotations
 
-import ast
 import hashlib
 import json
 import math
@@ -9,17 +8,21 @@ import shutil
 import sys
 import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
-from .ai import CASE_SCHEMA, DIAGNOSIS_SCHEMA, Codex, resolve_codex
+from .ai import CASE_SCHEMA, DIAGNOSIS_SCHEMA, Codex, describe_codex, resolve_codex
 from .cases import validate_cases
 from .common import file_key, save_json
 from .remote import fetch_snapshot, load_target, run_remote
 from .scan import Module, write_scan
-from .review import instructions, resource_root, write_sources, review_sources
+from .review import REVIEW_POLICY_VERSION, instructions, resource_root, write_sources, review_sources
 
 
-def validate_bundle(bundle, operator, module, runtime_sources):
+CASE_POLICY_VERSION = 3
+
+
+def validate_bundle(bundle, operator, runtime_sources):
     if bundle["status"] == "blocked":
         if not bundle["reason"].strip():
             raise ValueError("Blocked generation requires a reason")
@@ -31,31 +34,27 @@ def validate_bundle(bundle, operator, module, runtime_sources):
     if not isinstance(cases, list) or not cases:
         raise ValueError("Ready generation requires a nonempty JSON case array")
     validate_cases(cases)
-    tree = ast.parse(bundle["adapter_source"], filename=module + ".py")
-    # Compile only: do not import or execute AI-generated code on the controller.
-    compile(tree, module + ".py", "exec")
-    definitions = {n.name for n in tree.body if isinstance(n, ast.FunctionDef)}
     for case in cases:
         if case["kernel"] != operator["kernel"]:
             raise ValueError("Generated case belongs to a different kernel")
         if not isinstance(case.get("scenario"), str) or not case["scenario"].strip():
             raise ValueError("Each generated case needs a scenario description")
-        check = case.get("check", "")
-        if not check.startswith(module + ":") or check.split(":", 1)[1] not in definitions:
-            raise ValueError("Every automatic case requires a generated independent checker")
-        wrapper_module, symbol = case["wrapper"].split(":", 1)
-        if wrapper_module == module:
-            if case["mode"] != "wrapper" or symbol not in definitions:
-                raise ValueError("Generated adapters must expose a normal wrapper callable")
-        else:
-            path = wrapper_module.replace(".", "/") + ".py"
-            if path not in runtime_sources:
-                path = wrapper_module.replace(".", "/") + "/__init__.py"
-            if path not in runtime_sources:
-                raise ValueError(f"Case wrapper absent from actual NPU source snapshot: {case['wrapper']}")
-            definition = Module(path, runtime_sources[path]).functions.get(wrapper_module + "." + symbol)
-            if not definition or (case["mode"] == "triton" and not definition["jit"]):
-                raise ValueError(f"Case wrapper cannot be resolved in NPU source: {case['wrapper']}")
+        target_module, symbol = case["target"].split(":", 1)
+        path = target_module.replace(".", "/") + ".py"
+        if path not in runtime_sources:
+            path = target_module.replace(".", "/") + "/__init__.py"
+        if path not in runtime_sources:
+            raise ValueError(f"Case target absent from actual NPU source snapshot: {case['target']}")
+        definition = Module(path, runtime_sources[path]).functions.get(target_module + "." + symbol)
+        if not definition or not definition["jit"]:
+            raise ValueError(f"Case target is not a Triton JIT kernel in NPU source: {case['target']}")
+        if case.get("check"):
+            check_module, check_symbol = case["check"].split(":", 1)
+            reference_source = Path(__file__).with_name("references.py").read_text()
+            definitions = Module("kernel_tools/references.py", reference_source).functions
+            if (check_module != "kernel_tools.references" or
+                    f"kernel_tools.references.{check_symbol}" not in definitions):
+                raise ValueError("Automatic cases may only use correctness checks built into the framework")
     return cases
 
 
@@ -70,7 +69,23 @@ def render_pipeline(root, state, execution_report=""):
     if state.get("error"):
         lines += ["失败原因：" + state["error"], ""]
     if state.get("source_drift"):
-        lines += ["运行源码与目标 tag 存在差异：" + state["source_drift"], ""]
+        drift = state["source_drift"]
+        if isinstance(drift, dict):
+            lines += ["运行源码与目标 tag 存在差异："
+                      f"修改 {drift['changed_count']}、远端缺少 {drift['missing_count']}、"
+                      f"远端新增 {drift['extra_count']} 个 Python 文件。", "",
+                      f"远端 vLLM 包版本：`{drift.get('remote_package_version')}`；"
+                      f"远端源码 HEAD：`{drift.get('remote_head') or '未检测到'}`；"
+                      f"目标 commit：`{drift.get('target_commit')}`。", "",
+                      "差异示例：" + ", ".join(f"`{p}`" for p in drift["examples"]), ""]
+        else:
+            lines += ["运行源码与目标 tag 存在差异：" + drift, ""]
+    if state.get("ai"):
+        ai = state["ai"]
+        lines += ["AI："
+                  f"`{ai.get('model')}`（{ai.get('model_source')}），"
+                  f"推理强度 `{ai.get('reasoning_effort') or '由 Codex 配置决定'}`；"
+                  "release review、逐算子 case 生成和失败分析是独立调用。", ""]
     review = state.get("review", {})
     if review:
         lines += [review["summary"], "", "| 算子 | AI 判断 | 用例生成 | 原因 |", "|---|---|---|---|"]
@@ -83,6 +98,9 @@ def render_pipeline(root, state, execution_report=""):
         lines += [execution_report, ""]
     if state.get("diagnosis"):
         lines += ["## AI 失败分析", "", state["diagnosis"], ""]
+    if state.get("correctness_not_checked"):
+        lines += [f"数值正确性未检查的场景：{state['correctness_not_checked']}；"
+                  "这些场景只证明输入构造、编译和运行状态。", ""]
     logs = sorted((root / "logs").rglob("*.log")) if (root / "logs").exists() else []
     if logs:
         lines += ["## 完整失败日志", "", *[f"- [{p.name}]({p.relative_to(root).as_posix()})" for p in logs], ""]
@@ -93,8 +111,7 @@ def render_pipeline(root, state, execution_report=""):
 def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/gpu",
              codex=None, model=None, ai_timeout=1800, device=None,
              warmup=10, rounds=100, timeout=600, prepare_only=False,
-             allow_source_drift=False, dry_run=False, ai_client=None,
-             cases_output=None):
+             dry_run=False, ai_client=None, cases_output=None, resume=False):
     target_config = load_target(config, npu)
     configured_codex = resolve_codex(config, codex)
     device = device or target_config.get("device", "npu:0")
@@ -103,91 +120,174 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
     if not device.startswith("npu:") or not device[4:].isdigit():
         raise ValueError("device must be npu:<logical index>")
     root = Path(output).resolve()
-    cases_dir = Path(cases_output).resolve() if cases_output is not None else root / "cases"
+    workflow = root / "workflow.json"
+    prior = None
+    if resume:
+        if not workflow.is_file():
+            raise ValueError(f"Cannot resume without {workflow}")
+        prior = json.loads(workflow.read_text())
+        expected_run = {"base": base, "target": target, "npu": npu}
+        mismatched = [k for k, value in expected_run.items() if prior.get(k) != value]
+        if mismatched:
+            raise ValueError("Resume arguments differ from workflow.json: " + ", ".join(mismatched))
+        if prior.get("status") in {"completed", "no_new_operators"}:
+            raise ValueError(f"Pipeline is already {prior['status']}; nothing to resume")
+        stored_cases = Path(prior.get("cases_path", root / "cases")).resolve()
+        if cases_output is not None and Path(cases_output).resolve() != stored_cases:
+            raise ValueError("--cases-output differs from the original workflow")
+        cases_dir = stored_cases
+    else:
+        cases_dir = Path(cases_output).resolve() if cases_output is not None else root / "cases"
     if cases_dir == root or (cases_dir.is_relative_to(root) and
                              cases_dir.relative_to(root).parts[0] in {"adapters", "results", "logs"}):
         raise ValueError("--cases-output must be a separate case directory")
     if dry_run:
+        ai_plan = describe_codex(configured_codex, model, ai_timeout)
         print(json.dumps({"base": base, "target": target, "npu": npu, "device": device,
-            "steps": ["scan", "AI review with release skill", "read actual NPU sources",
-                      "AI cases/reference with case skill", "validate",
+            "steps": ["scan", "reuse AI review" if resume and prior.get("review") else "AI review with release skill", "read actual NPU sources",
+                      "AI JSON cases with case skill", "validate",
                       "stop after generation" if prepare_only else "NPU run and failure analysis"],
-            "AI": {"command": [configured_codex, "exec"], "model": model or "Codex configured default"},
+            "AI": {**ai_plan, "command": [configured_codex, "exec"]},
             "output": str(root), "cases_output": str(cases_dir),
+            "resume": resume,
             "note": "No AI request, SSH connection or NPU job started"}, ensure_ascii=False, indent=2))
         return 0
-    if root.exists() and any(root.iterdir()):
+    if not resume and root.exists() and any(root.iterdir()):
         raise ValueError(f"Pipeline output already exists: {root}; use a new output directory")
-    if cases_dir.exists() and (not cases_dir.is_dir() or any(cases_dir.iterdir())):
+    if not resume and cases_dir.exists() and (not cases_dir.is_dir() or any(cases_dir.iterdir())):
         raise ValueError(f"Case output already exists: {cases_dir}; use a new or empty directory")
     root.mkdir(parents=True, exist_ok=True)
-    state = {"schema_version": 1, "base": base, "target": target, "npu": npu,
-             "status": "running", "stage": "scan", "generation": {},
-             "cases_path": str(cases_dir), "model": model or "Codex configured default"}
+    state = prior or {"schema_version": 2, "base": base, "target": target, "npu": npu,
+                      "status": "running", "stage": "scan", "generation": {},
+                      "cases_path": str(cases_dir), "scope": scope, "stage_history": []}
+    if resume:
+        state["status"] = "running"
+        state.pop("error", None)
+        state.setdefault("resumes", []).append(datetime.now(timezone.utc).isoformat())
     execution_report = ""
     def persist():
         render_pipeline(root, state, execution_report)
-    def stage(name):
+    def stage(name, progress=None):
         state["stage"] = name
-        print(f"[pipeline] {name}", flush=True)
+        state.setdefault("stage_history", []).append({"stage": name,
+            "time": datetime.now(timezone.utc).isoformat()})
+        prefix = f"[pipeline {progress}]" if progress else "[pipeline]"
+        print(f"{prefix} {name}", flush=True)
         persist()
     persist()
     try:
         ai = ai_client or Codex(configured_codex, model, ai_timeout)
+        state["ai"] = (ai.description() if hasattr(ai, "description") else {
+            "executable": configured_codex, "model": model or "test/configured AI",
+            "model_source": "injected/configured", "reasoning_effort": None,
+            "timeout_seconds": ai_timeout})
+        state["model"] = state["ai"]["model"]
+        print(f"[pipeline] output={root}", flush=True)
+        print(f"[pipeline] AI model={state['ai']['model']} ({state['ai']['model_source']}), "
+              f"executable={state['ai']['executable']}", flush=True)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-pipeline-") as tmp:
             workspace = Path(tmp)
-            delta = write_scan(repo, base, target, workspace / "scan", scope)
+            stage("Static scan and exact tag source extraction", "1/6")
+            delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
             state["delta"] = delta
             before = json.loads((workspace / "scan/base.json").read_text())
             after = json.loads((workspace / "scan/target.json").read_text())
             write_sources(repo, base, workspace / "base")
             commit, target_sources = write_sources(repo, target, workspace / "target")
-            stage("AI review")
-            review = review_sources(ai, delta, target_sources, before, workspace,
-                                    root / "logs/ai-review.log")
-            state["review"] = review
+            if (resume and state.get("review") and
+                    state.get("review_policy_version") == REVIEW_POLICY_VERSION):
+                review = state["review"]
+                from .review import validate_review
+                validate_review(review, delta, target_sources, before)
+                stage("Reuse completed AI release review", "2/6")
+            else:
+                stage("AI release review with vllm-triton-release-scan", "2/6")
+                review = review_sources(ai, delta, target_sources, before, workspace,
+                                        root / "logs/ai-review.log")
+                state["review"] = review
+                state["review_policy_version"] = REVIEW_POLICY_VERSION
             operators = [r for r in review["operators"] if r["classification"] == "new"]
+            operator_ids = {r["id"] for r in operators}
+            # Old pipeline revisions generated per-run adapter modules. They are
+            # incompatible with the JSON-only case policy and must not leak into
+            # a resumed run or keep out-of-scope operators executable.
+            for identity in list(state.get("generation", {})):
+                saved = state["generation"][identity]
+                if identity in operator_ids and saved.get("case_policy_version") == CASE_POLICY_VERSION:
+                    continue
+                (cases_dir / (file_key(identity) + ".json")).unlink(missing_ok=True)
+                legacy_module = "kt_generated_" + hashlib.sha256(identity.encode()).hexdigest()[:16]
+                (root / "adapters" / (legacy_module + ".py")).unlink(missing_ok=True)
+                state["generation"].pop(identity)
+            if (root / "adapters").is_dir() and not any((root / "adapters").iterdir()):
+                (root / "adapters").rmdir()
             incomplete = bool(review["unresolved"] or any(r["classification"] == "needs_review" for r in review["operators"]))
             if not operators:
                 state["status"] = "needs_review" if incomplete else "no_new_operators"
                 persist()
                 return 1 if incomplete else 0
-            stage("NPU source snapshot")
+            stage(f"Read and verify actual sources on {npu}", "3/6")
             snapshot = fetch_snapshot(target_config, workspace / "runtime", device=device,
                                       failure_log=root / "logs/snapshot.log")
             state["runtime"] = snapshot
             expected = {p: hashlib.sha256(s.encode()).hexdigest() for p, s in target_sources.items()}
             actual = {p: h for p, h in snapshot["identity"]["files"].items() if p.startswith("vllm/")}
             if expected != actual:
-                drift = sorted(p for p in expected.keys() | actual.keys() if expected.get(p) != actual.get(p))
-                state["source_drift"] = f"{len(drift)} Python files differ; examples: {', '.join(drift[:5])}"
-                if not allow_source_drift:
-                    raise ValueError("Remote vLLM differs from requested target tag. Select the matching environment, "
-                                     "or explicitly use --allow-source-drift to test actual remote sources")
+                changed = sorted(p for p in expected.keys() & actual.keys() if expected[p] != actual[p])
+                missing = sorted(expected.keys() - actual.keys())
+                extra = sorted(actual.keys() - expected.keys())
+                drift = changed + missing + extra
+                state["source_drift"] = {
+                    "changed_count": len(changed), "missing_count": len(missing),
+                    "extra_count": len(extra), "examples": drift[:20],
+                    "target_commit": commit,
+                    "remote_package_version": snapshot["environment"].get("packages", {}).get("vllm"),
+                    "remote_head": snapshot["environment"].get("source_revisions", {}).get("vllm", {}).get("head"),
+                    "remote_fingerprint": snapshot["identity"]["fingerprint"],
+                }
+                raise ValueError(f"Remote vLLM differs from {target}: {len(changed)} changed, "
+                                 f"{len(missing)} missing and {len(extra)} extra Python files. "
+                                 "The remote imported source must match the target exactly; "
+                                 "align the remote environment, then resume this output with --resume")
+            else:
+                state.pop("source_drift", None)
             if not snapshot["environment"].get("npu_available") and not prepare_only:
                 raise ValueError("NPU unavailable: " + snapshot["environment"].get("npu_error", "environment probe failed"))
             runtime_sources = {p: (workspace / "runtime" / p).read_text()
                                for p in snapshot["identity"]["files"]}
             cases = []
-            for operator in operators:
+            for index, operator in enumerate(operators, 1):
                 key = file_key(operator["id"])
-                module = "kt_generated_" + hashlib.sha256(operator["id"].encode()).hexdigest()[:16]
-                stage("AI cases: " + operator["kernel"])
+                saved = state.get("generation", {}).get(operator["id"], {})
+                case_file = cases_dir / (key + ".json")
+                if (resume and saved.get("status") == "ready" and
+                        saved.get("case_policy_version") == CASE_POLICY_VERSION and case_file.is_file()):
+                    generated = json.loads(case_file.read_text())
+                    fingerprints = {c.get("source", {}).get("runtime_fingerprint") for c in generated}
+                    if fingerprints != {snapshot["identity"]["fingerprint"]}:
+                        raise ValueError(f"Saved cases for {operator['kernel']} use a different remote source "
+                                         "fingerprint; start a new output directory")
+                    bundle = {"status": "ready", "reason": saved.get("reason", ""),
+                              "analysis": saved.get("analysis", ""),
+                              "cases_json": json.dumps(generated)}
+                    validate_bundle(bundle, operator, runtime_sources)
+                    cases.extend(generated)
+                    stage(f"Reuse cases {index}/{len(operators)}: {operator['kernel']}", "4/6")
+                    continue
+                stage(f"Generate cases {index}/{len(operators)}: {operator['kernel']}", "4/6")
                 task = ("Generate multi-scenario cases for this operator:\n" + json.dumps(operator, ensure_ascii=False)
                     + "\nRead target/ for intended upstream behavior and runtime/ for ACTUAL imported NPU sources. "
                     "runtime/snapshot.json records versions. Resolve Ascend patches and imports from runtime; "
                     "do not assume the upstream implementation is the effective replacement. Explain the selected "
                     "binding, shape/index/stride/pointer/alias/reset contract, coverage and measurement scope in analysis. "
-                    "Return cases_json as a JSON array string and adapter_source as one Python module's source. "
-                    f"The generated module name is {module}. Every case must have kernel={operator['kernel']!r}, "
-                    f"a scenario description, and an independent check={module}:FUNCTION defined in adapter_source. "
-                    "Use mode=triton to launch real upstream/Ascend kernels directly when possible. For complex "
-                    "views/state expose a normal adapter wrapper in that generated module which calls the real "
-                    "kernel; do not copy/reimplement the kernel under test or time a reference instead. Adapter "
-                    "may import torch/triton/runtime packages; no shell, network, filesystem writes or production "
-                    "changes. Checks run once after first invocation and before warmup; use independent CPU/Torch "
-                    "reference and assert untouched regions where meaningful. If an independent reference or "
-                    "legal inputs cannot be established, return blocked with reason instead of a dummy pass. "
+                    "Return cases_json as a JSON array string. Every case must have "
+                    f"kernel={operator['kernel']!r} and a scenario description. Use only the JSON materializer "
+                    "capabilities documented in the case format and point target at the real runtime Triton kernel. "
+                    "Every case directly launches target[grid](...); do not emit mode or wrapper fields. "
+                    "Do not generate Python adapters, helper wrappers, references or checkers. A case may "
+                    "name an existing kernel_tools.references checker only when it exactly applies. If legal inputs "
+                    "cannot be expressed by the framework, return blocked with a specific missing framework "
+                    "capability instead of generating auxiliary code or simplifying the operator. "
                     "Include smoke, typical and relevant boundaries based on actual branches, not arbitrary "
                     "Cartesian products. Avoid stress/OOM sizes; all cases should fit the selected NPU. "
                     "No NPU execution at this stage.\nCase format:\n" + (resource_root() / "docs/cases.md").read_text())
@@ -195,8 +295,10 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                 for attempt in range(2):
                     try:
                         bundle = ai.ask(instructions("vllm-ascend-kernel-cases", task), CASE_SCHEMA,
-                            workspace=workspace, failure_log=root / "logs" / f"ai-cases-{key}-{attempt + 1}.log")
-                        generated = validate_bundle(bundle, operator, module, runtime_sources)
+                            workspace=workspace, failure_log=root / "logs" / f"ai-cases-{key}-{attempt + 1}.log",
+                            label=f"case generation {index}/{len(operators)}: {operator['kernel']} "
+                                  "(vllm-ascend-kernel-cases)")
+                        generated = validate_bundle(bundle, operator, runtime_sources)
                         break
                     except (ValueError, OSError) as error:
                         log = root / "logs" / f"generation-{key}-{attempt + 1}.log"
@@ -207,7 +309,10 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                             bundle = {"status": "blocked", "reason": str(error), "analysis": ""}
                         else:
                             task += "\nPrevious generation failed validation; correct this error: " + str(error)
-                state["generation"][operator["id"]] = {k: bundle[k] for k in ("status", "reason", "analysis")}
+                state["generation"][operator["id"]] = {
+                    **{k: bundle[k] for k in ("status", "reason", "analysis")},
+                    "case_policy_version": CASE_POLICY_VERSION,
+                }
                 if not generated:
                     incomplete = True
                     persist()
@@ -216,9 +321,6 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                     case["source"] = {"target_commit": commit, "operator_id": operator["id"],
                                       "runtime_fingerprint": snapshot["identity"]["fingerprint"]}
                 save_json(cases_dir / (key + ".json"), generated)
-                path = root / "adapters" / (module + ".py")
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(bundle["adapter_source"])
                 cases.extend(generated)
                 persist()
             if prepare_only or not cases:
@@ -226,45 +328,49 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                 persist()
                 return 1 if incomplete or not cases else 0
             validate_cases(cases)
-            stage("NPU execution")
+            stage(f"Execute {len(cases)} generated cases on {npu}", "5/6")
             execution = workspace / "execution"
             code = run_remote(target_config, cases, execution, device=device, warmup=warmup,
-                              rounds=rounds, timeout=timeout, assets=root / "adapters",
+                              rounds=rounds, timeout=timeout,
                               expected_identity=snapshot["identity"]["fingerprint"])
             execution_report = (execution / "report.md").read_text()
             for name in ("results", "logs"):
                 if (execution / name).exists():
+                    if name == "results" and (root / name).exists():
+                        shutil.rmtree(root / name)
                     shutil.copytree(execution / name, root / name, dirs_exist_ok=True)
-            # Keep the original generated cases and adapters; execution retains the same inputs remotely.
+            # Keep the original generated cases; execution retains the same inputs remotely.
             results = [json.loads(p.read_text()) for p in (root / "results").glob("*.json")]
             identities = [(d["kernel"], r["name"]) for d in results for r in d["scenarios"]]
             expected_cases = {(c["kernel"], c["name"]) for c in cases}
             if set(identities) != expected_cases or len(identities) != len(expected_cases):
                 raise ValueError("Downloaded results do not cover exactly the generated cases")
-            failures = [r for d in results for r in d["scenarios"]
-                        if r["status"] != "success" or r.get("correctness") != "passed"]
+            failures = [r for d in results for r in d["scenarios"] if r["status"] != "success"]
+            state["correctness_not_checked"] = sum(
+                r.get("correctness") != "passed" for d in results for r in d["scenarios"]
+            )
             if code or failures:
-                stage("AI failure analysis")
+                stage("AI failure analysis with vllm-triton-remote-benchmark", "6/6")
                 shutil.copytree(root / "results", workspace / "results")
                 if (root / "logs").exists():
                     shutil.copytree(root / "logs", workspace / "logs")
                 shutil.copytree(cases_dir, workspace / "cases")
-                shutil.copytree(root / "adapters", workspace / "adapters")
                 try:
                     diagnosis = ai.ask(instructions("vllm-triton-remote-benchmark",
-                        "Analyze failed/blocked cases from results/, full logs/, cases/, adapters/ and runtime/. "
+                        "Analyze failed/blocked cases from results/, full logs/, cases/ and runtime/. "
                         "Do not run tests or modify files. Report observed errors separately from inferred cause, "
                         "cite concrete log/source paths and evidence, state uncertainty, and distinguish input, "
                         "reference, import, compile, runtime, correctness and environment failures. Do not change "
                         "measured statuses or claim a kernel bug solely from an AI-generated reference mismatch. "
                         "Give a concise Chinese failure explanation for the final report."), DIAGNOSIS_SCHEMA,
-                        workspace=workspace, failure_log=root / "logs/ai-diagnosis.log")
+                        workspace=workspace, failure_log=root / "logs/ai-diagnosis.log",
+                        label="failure analysis (vllm-triton-remote-benchmark)")
                     state["diagnosis"] = diagnosis["analysis"]
                 except ValueError as error:
                     state["diagnosis"] = "AI 分析未完成：" + str(error)
                     incomplete = True
             state["status"] = "failed" if code or failures else "needs_review" if incomplete else "completed"
-            stage("finished")
+            stage("Finished", "6/6")
             return 1 if code or failures or incomplete else 0
     except (Exception, KeyboardInterrupt) as error:
         state["status"] = "interrupted" if isinstance(error, KeyboardInterrupt) else "blocked"
