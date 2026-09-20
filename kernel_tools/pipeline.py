@@ -48,13 +48,6 @@ def validate_bundle(bundle, operator, runtime_sources):
         definition = Module(path, runtime_sources[path]).functions.get(target_module + "." + symbol)
         if not definition or not definition["jit"]:
             raise ValueError(f"Case target is not a Triton JIT kernel in NPU source: {case['target']}")
-        if case.get("check"):
-            check_module, check_symbol = case["check"].split(":", 1)
-            reference_source = Path(__file__).with_name("references.py").read_text()
-            definitions = Module("kernel_tools/references.py", reference_source).functions
-            if (check_module != "kernel_tools.references" or
-                    f"kernel_tools.references.{check_symbol}" not in definitions):
-                raise ValueError("Automatic cases may only use correctness checks built into the framework")
     return cases
 
 
@@ -284,8 +277,8 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                     f"kernel={operator['kernel']!r} and a scenario description. Use only the JSON materializer "
                     "capabilities documented in the case format and point target at the real runtime Triton kernel. "
                     "Every case directly launches target[grid](...); do not emit mode or wrapper fields. "
-                    "Do not generate Python adapters, helper wrappers, references or checkers. A case may "
-                    "name an existing kernel_tools.references checker only when it exactly applies. If legal inputs "
+                    "Do not generate Python adapters, helper wrappers, references or checkers; all generated cases "
+                    "must omit check and will report correctness=not_checked. If legal inputs "
                     "cannot be expressed by the framework, return blocked with a specific missing framework "
                     "capability instead of generating auxiliary code or simplifying the operator. "
                     "Include smoke, typical and relevant boundaries based on actual branches, not arbitrary "

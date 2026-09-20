@@ -41,7 +41,7 @@ python -m pip install -e . --no-deps
 kernel-tools --help
 ```
 
-`python -m kernel_tools` 与 `kernel-tools` 完全等价。示例有 3 个 `_fill_num_accepted_kernel` case 和独立的输出检查；示例 JSON 的 `source` 记录生成依据，换源码版本后应重新核对。仓库本身的 CPU 检查不代表这些 case 已在目标 NPU 运行成功。
+`python -m kernel_tools` 与 `kernel-tools` 完全等价。示例有 3 个 `_fill_num_accepted_kernel` case；示例 JSON 的 `source` 记录生成依据，换源码版本后应重新核对。当前框架不内置单算子 reference，运行成功仍会明确记录 `correctness=not_checked`。
 
 ## 从本机跑远端 NPU
 
@@ -174,7 +174,7 @@ python -m kernel_tools run examples/fill_num_accepted.json \
   --config kernel-tools.json --target npu162 --output artifacts/fill-all
 ```
 
-工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造和可选 reference 由统一测试框架提供，自动流程不生成辅助 Python 文件。
+工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造由统一测试框架提供，自动流程不生成辅助 Python 文件或单算子 reference。
 
 查看计划而不连接远端：
 
@@ -212,7 +212,7 @@ artifacts/fill-all/
   report.md    # 场景结果、耗时、失败原因与日志链接
 ```
 
-文件名带短哈希，防止同名/长名称覆盖。成功只保留 mean/p50/p90/p99/min/max；不保存逐轮耗时、中间输入或成功日志。报告中的 `correctness=not_checked` 明确表示未校验数值；有 `check` 回调且断言通过才是 `passed`。
+文件名带短哈希，防止同名/长名称覆盖。成功只保留 mean/p50/p90/p99/min/max；不保存逐轮耗时、中间输入或成功日志。当前没有通用数值比较协议，因此报告统一使用 `correctness=not_checked`，不能把编译和运行成功解释为数值正确。
 
 ## 扫描某个版本的变化
 

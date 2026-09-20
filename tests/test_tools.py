@@ -105,7 +105,7 @@ row={k:case[k] for k in ('name','kernel','target')}
 row.update(device=a.device,warmup=int(a.warmup),profiling_rounds=int(a.profiling_rounds),
            latencies_ms=[.01]*int(a.profiling_rounds),
            summary={k+'_ms':.01 for k in ('mean','p50','p90','p99','min','max')},
-           correctness='passed' if case.get('check') else 'not_checked')
+           correctness='not_checked')
 if a.case_name=='bad_identity': row['kernel']='wrong_kernel'
 if a.case_name=='bad_samples': row['latencies_ms']=[]
 Path(a.output).write_text(json.dumps([row]))

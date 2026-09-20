@@ -78,7 +78,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
 - 默认要求远端 vLLM Python 源码与目标 tag 一致。不同就停止，并在报告说明差异；不会擅自 checkout/reset 生产源码。
 - 源码不同就固定停止；不存在绕过源码身份校验的参数。对齐远端实际 import 的源码后才能继续。
 - 生成后、执行前再核对实际源码与软件环境指纹；发生变化时阻塞执行。快照覆盖包内普通 `.py` 文件，原生库只记录包版本，不是整个环境镜像的字节级证明。
-- 自动生成的 case 只保存真实 Triton `target`、`grid` 和参数，固定执行 `target[grid](...)`；不支持 Python wrapper 模式，也不生成辅助 Python adapter/checker。生产 wrapper 仅作为推导输入与启动配置的源码依据。框架已有且完全适用的 reference 可以通过 `kernel_tools.references` 使用；否则结果标记 `correctness=not_checked`。JSON materializer 无法表达合法输入时明确 blocked，并记录需要扩展的框架能力。
+- 自动生成的 case 只保存真实 Triton `target`、`grid` 和参数，固定执行 `target[grid](...)`；不支持 Python wrapper 模式，也不生成辅助 Python adapter/checker。生产 wrapper 仅作为推导输入与启动配置的源码依据。框架不保存单算子 reference，所有场景明确标记 `correctness=not_checked`。JSON materializer 无法表达合法输入时明确 blocked，并记录需要扩展的框架能力。
 - 程序能证明产物格式、启动位置和运行结果，不能证明 AI 的语义判断绝对正确，也不能将单算子成功视为整网命中。
 
 ## 只保留最终需要的产物

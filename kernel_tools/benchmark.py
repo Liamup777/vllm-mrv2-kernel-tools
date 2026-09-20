@@ -105,13 +105,6 @@ def resolve_target(path: str) -> Any:
     return target
 
 
-def resolve_checker(path: str) -> Any:
-    checker = resolve_symbol(path)
-    if not callable(checker):
-        raise TypeError(f"Resolved checker is not callable: {path}")
-    return checker
-
-
 def _resolve_dtype(name: str) -> torch.dtype:
     attribute = name.removeprefix("torch.")
     dtype = getattr(torch, attribute, None)
@@ -258,7 +251,6 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
     PHASE = "import"
     target_path = case["target"]
     target = resolve_target(target_path)
-    checker = resolve_checker(case["check"]) if case.get("check") else None
     function = getattr(target, "fn", target)
     try:
         actual_file = str(Path(inspect.getfile(function)).resolve())
@@ -283,16 +275,8 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
             torch.npu.synchronize()
 
     PHASE = "runtime"
-    output = invoke(args, kwargs)
+    invoke(args, kwargs)
     torch.npu.synchronize()
-    correctness = "not_checked"
-    if checker:
-        PHASE = "correctness"
-        result = checker(args, kwargs, output)
-        if result is not None and result is not True:
-            raise AssertionError("correctness checker must return None/True or raise on mismatch")
-        torch.npu.synchronize()
-        correctness = "passed"
     PHASE = "runtime"
     warmup = case.get("warmup", 10)
     rounds = case.get("profiling_rounds", 100)
@@ -314,7 +298,7 @@ def benchmark_case(case: dict[str, Any]) -> dict[str, Any]:
     return {"name": case["name"], "target": target_path,
             "kernel": case["kernel"], "grid": case.get("grid"), "device": device,
             "warmup": warmup, "profiling_rounds": rounds, "binding": binding,
-            "correctness": correctness, "seed": case.get("seed", 0),
+            "correctness": "not_checked", "seed": case.get("seed", 0),
             "benchmark_scope": case.get("benchmark_scope",
                 "Triton launch only; input reset and check excluded"),
             "latencies_ms": latencies_ms, "summary": summarize(latencies_ms)}

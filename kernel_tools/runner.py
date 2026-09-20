@@ -90,8 +90,8 @@ def validate_result(data, case, device, warmup, rounds):
     if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in [*samples, *values.values()]):
         raise ValueError("worker returned invalid latency")
     correctness = row.get("correctness", "not_checked")
-    if correctness not in ("passed", "not_checked") or (case.get("check") and correctness != "passed"):
-        raise ValueError("worker did not confirm the requested correctness check")
+    if correctness != "not_checked":
+        raise ValueError("worker reported correctness without a framework-level comparison protocol")
     return {"status": "success", "correctness": correctness,
             "latency_us": {k: v * 1000 for k, v in values.items()},
             "binding": row.get("binding"), "benchmark_scope": row.get("benchmark_scope")}

@@ -68,8 +68,11 @@ def validate_cases(cases):
                 raise ValueError(f"{label}: {key} must be an integer >= {minimum}")
         if "reset_inputs" in case and not isinstance(case["reset_inputs"], bool):
             raise ValueError(f"{label}: reset_inputs must be boolean")
-        if "check" in case and (not isinstance(case["check"], str) or ":" not in case["check"]):
-            raise ValueError(f"{label}: check must be module:function")
+        if "check" in case:
+            raise ValueError(
+                f"{label}: operator-specific check callbacks are unsupported; "
+                "remove 'check' and report correctness=not_checked"
+            )
         validate_value(case.get("arguments", case.get("kwargs", {})), label)
         validate_value(case.get("args", []), label)
 

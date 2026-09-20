@@ -9,7 +9,6 @@
   "target": "vllm.v1.worker.gpu.model_states.mamba_hybrid:_fill_num_accepted_kernel",
   "grid": [1],
   "seed": 42,
-  "check": "kernel_tools.references:check_fill_num_accepted",
   "arguments": {
     "idx_mapping_ptr": {"shape": [1], "dtype": "int32", "initializer": "arange"},
     "num_accepted_ptr": {"shape": [1], "dtype": "int32", "initializer": "zeros"},
@@ -52,11 +51,7 @@ worker 先做一次不计时执行用于编译和可选检查，随后 warmup �
 
 ## 数值检查
 
-可选 `check: kernel_tools.references:function`，只能使用框架中已经实现的 reference。函数签名为 `check(args, kwargs, output)`；Triton kernel 通常通过 kwargs 中的输出 tensor 检查。通过时返回 None/True，失败时抛出异常或返回 False。
-
-检查在第一次执行并同步后进行，且在计时前。检查失败记为 `phase=correctness`，不生成耗时。没有 checker 一律 `correctness=not_checked`。检查过一次输入不能泛化为所有 shape 或模型精度正确。
-
-示例的 `check_fill_num_accepted` 只适用于 output 初始为零的 case；它检查 sentinel 被跳过、映射位置写入指定值、未触及位置保持零。
+当前框架不内置任何单算子 reference，也不接受 `check` 回调；成功执行统一记录为 `correctness=not_checked`。单算子专用 PyTorch/CPU 实现不属于通用工具代码。以后如需自动数值校验，应先设计与算子无关的 JSON 比较协议，再由 case 声明期望张量或通用约束。
 
 ## 状态与日志
 

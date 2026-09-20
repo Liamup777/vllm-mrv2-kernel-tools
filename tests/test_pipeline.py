@@ -100,7 +100,7 @@ class PipelineTest(unittest.TestCase):
         self.assertTrue(kwargs["expected_identity"])
         output.mkdir()
         save_json(output / "results/added.json", {"kernel": "added", "scenarios": [
-            {"name": c["name"], "status": "success", "correctness": "passed"} for c in cases]})
+            {"name": c["name"], "status": "success", "correctness": "not_checked"} for c in cases]})
         (output / "report.md").write_text("# Measured fixture report\n")
         return 0
 
@@ -259,12 +259,12 @@ class PipelineTest(unittest.TestCase):
             self.assertEqual(self.run_flow(), 1)
         self.assertIn("exactly the generated cases", self.state()["error"])
 
-    def test_target_must_exist_and_generated_checker_is_rejected(self):
+    def test_target_must_exist_and_operator_check_is_rejected(self):
         bundle = generated()
         cases = json.loads(bundle["cases_json"])
         cases[0]["check"] = "generated_reference:check"
         bundle["cases_json"] = json.dumps(cases)
-        with self.assertRaisesRegex(ValueError, "built into the framework"):
+        with self.assertRaisesRegex(ValueError, "operator-specific check callbacks are unsupported"):
             validate_bundle(bundle, OPERATOR, {PATH: SOURCE})
         with self.assertRaisesRegex(ValueError, "absent"):
             validate_bundle(generated(), OPERATOR, {})

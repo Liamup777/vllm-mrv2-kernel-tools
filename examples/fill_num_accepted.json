@@ -6,7 +6,6 @@
       1
     ],
     "seed": 42,
-    "check": "kernel_tools.references:check_fill_num_accepted",
     "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
     "source": {
       "repository": "vllm-project/vllm",
@@ -40,7 +39,6 @@
       32
     ],
     "seed": 42,
-    "check": "kernel_tools.references:check_fill_num_accepted",
     "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
     "source": {
       "repository": "vllm-project/vllm",
@@ -74,7 +72,6 @@
       3
     ],
     "seed": 42,
-    "check": "kernel_tools.references:check_fill_num_accepted",
     "scenario": "PP incomplete prefill writes neutral accepted-token count; synthetic inputs",
     "source": {
       "repository": "vllm-project/vllm",
