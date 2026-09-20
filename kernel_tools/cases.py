@@ -37,6 +37,12 @@ def validate_cases(cases):
     seen = set()
     for case in cases:
         label = f"{case.get('kernel', '?')}/{case.get('name', '?')}"
+        if "target" not in case and "wrapper" in case:
+            if case.get("mode") == "triton":
+                raise ValueError(
+                    f"{label}: legacy Triton case; rename 'wrapper' to 'target' and remove 'mode'"
+                )
+            raise ValueError(f"{label}: legacy wrapper case cannot be migrated; regenerate a direct Triton case")
         for key in ("name", "kernel", "target"):
             if not isinstance(case.get(key), str) or not case[key].strip():
                 raise ValueError(f"{label}: requires nonempty '{key}'")
