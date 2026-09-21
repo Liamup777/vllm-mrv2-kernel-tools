@@ -25,6 +25,7 @@ PATH = "vllm/v1/worker/gpu/new.py"
 IDENTITY = "vllm.v1.worker.gpu.new.added"
 OPERATOR = {"id": IDENTITY, "kernel": "added", "definition": PATH, "classification": "new",
             "reason": "Only in target tag", "evidence": PATH + ":4 wrapper directly launches added"}
+REVIEW_OPERATOR = {key: OPERATOR[key] for key in ("id", "classification", "reason", "evidence")}
 MODULE = "kt_generated_" + hashlib.sha256(IDENTITY.encode()).hexdigest()[:16]
 
 
@@ -44,7 +45,8 @@ class FakeAI:
     def ask(self, prompt, schema, **kwargs):
         self.calls.append((prompt, schema))
         if schema == REVIEW_SCHEMA:
-            return {"operators": [] if self.omit else [OPERATOR], "unresolved": [], "summary": "one new kernel"}
+            operators = [] if self.omit else [dict(REVIEW_OPERATOR)]
+            return {"operators": operators, "unresolved": [], "summary": "one new kernel"}
         if schema == CASE_SCHEMA:
             result = generated()
             if self.fail_cases:
@@ -338,7 +340,10 @@ class ReviewCommandTest(unittest.TestCase):
         report = json.loads((f.output / "review.json").read_text())
         self.assertEqual(report["status"], "reviewed")
         self.assertFalse(report["complete_inventory"])
-        self.assertEqual(report["review"]["operators"][0]["classification"], "new")
+        operator = report["review"]["operators"][0]
+        self.assertEqual(operator["classification"], "new")
+        self.assertEqual(operator["kernel"], "added")
+        self.assertEqual(operator["definition"], PATH)
 
     def test_ai_failure_never_reports_static_scan_as_reviewed(self):
         from kernel_tools.review import scan_with_ai

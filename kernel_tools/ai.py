@@ -21,7 +21,7 @@ def object_schema(properties):
 STRING = {"type": "string"}
 REVIEW_SCHEMA = object_schema({
     "operators": {"type": "array", "items": object_schema({
-        "id": STRING, "kernel": STRING, "definition": STRING,
+        "id": STRING,
         "classification": {"type": "string", "enum": ["new", "not_new", "needs_review"]},
         "reason": STRING, "evidence": STRING})},
     "unresolved": {"type": "array", "items": STRING},

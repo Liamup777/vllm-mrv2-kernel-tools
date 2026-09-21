@@ -12,7 +12,7 @@ from .common import save_json
 from .scan import Module, tagged_sources, write_scan
 
 
-REVIEW_POLICY_VERSION = 2
+REVIEW_POLICY_VERSION = 3
 
 
 def resource_root():
@@ -43,6 +43,22 @@ def write_sources(repo, tag, destination):
     return commit, files
 
 
+def resolve_target_definition(identity, target_sources):
+    """Resolve an AI-returned identity against authoritative target-tag ASTs."""
+    parts = identity.split(".")
+    for end in range(len(parts) - 1, 0, -1):
+        module = ".".join(parts[:end])
+        for path in (module.replace(".", "/") + ".py",
+                     module.replace(".", "/") + "/__init__.py"):
+            source = target_sources.get(path)
+            if source is None:
+                continue
+            definition = Module(path, source).functions.get(identity)
+            if definition and definition["jit"]:
+                return path, definition
+    return None, None
+
+
 def validate_review(review, delta, target_sources, before):
     required = set(delta["added"]) | {m["to"] for m in delta["moved_or_renamed"]}
     seen = set()
@@ -55,15 +71,15 @@ def validate_review(review, delta, target_sources, before):
         seen.add(identity)
         if not row["reason"].strip() or not row["evidence"].strip():
             raise ValueError(f"AI review lacks source evidence: {identity}")
+        path, definition = resolve_target_definition(identity, target_sources)
+        if definition is not None:
+            row["kernel"] = definition["node"].name
+            row["definition"] = path
         if row["classification"] == "new":
             if identity in known or identity in moved:
                 raise ValueError(f"AI called an existing/moved operator new: {identity}")
-            source = target_sources.get(row["definition"])
-            if source is None:
-                raise ValueError(f"AI definition does not exist at target tag: {identity}")
-            definition = Module(row["definition"], source).functions.get(identity)
-            if not definition or not definition["jit"] or definition["node"].name != row["kernel"]:
-                raise ValueError(f"AI operator is not a matching JIT definition: {identity}")
+            if definition is None:
+                raise ValueError(f"AI new operator is not a target-tag Triton JIT definition: {identity}")
     if required - seen:
         raise ValueError("AI silently omitted candidates: " + ", ".join(sorted(required - seen)))
 
@@ -87,8 +103,8 @@ def review_sources(ai, delta, target_sources, before, workspace, failure_log):
         "call path to a preexisting operator, moved/renamed code, helper-only JIT and existing modified kernels. "
         "Account for EVERY delta.added and moved_or_renamed target with new/not_new/needs_review. "
         "Add missed operators only when they meet the local-definition or explicit-import boundary. "
-        "For each operator, id is the fully qualified Python function, definition is the relative "
-        "source file path and kernel is its function name. Evidence must cite definition and direct "
+        "For each operator, id is the fully qualified Python function. The controller resolves definition and kernel "
+        "from the target-tag AST; do not return those redundant fields. Evidence must cite the definition and direct "
         "launch path:line, wrapper/call path and activation condition; compare against base to explain "
         "whether it is truly new. Ordinary list[T]()/set[T](), generic containers, dispatch tables and "
         "unlaunched helpers must not be counted as Triton launches. Changes only in a shared module "
@@ -101,7 +117,16 @@ def review_sources(ai, delta, target_sources, before, workspace, failure_log):
     result = ai.ask(instructions("vllm-triton-release-scan", task), REVIEW_SCHEMA,
                     workspace=workspace, failure_log=failure_log,
                     label="release review (vllm-triton-release-scan)")
-    validate_review(result, delta, target_sources, before)
+    try:
+        validate_review(result, delta, target_sources, before)
+    except ValueError as error:
+        failure_log = Path(failure_log)
+        failure_log.parent.mkdir(parents=True, exist_ok=True)
+        failure_log.write_text(json.dumps(
+            {"validation_error": str(error), "ai_review": result},
+            ensure_ascii=False, indent=2,
+        ) + "\n")
+        raise
     return result
 
 
@@ -123,7 +148,8 @@ def render_review(root, document):
             if not groups[category]:
                 lines += ["无。", ""]
             for row in groups[category]:
-                lines += [f"### `{row['kernel']}`", "", f"定义：`{row['definition']}`", "",
+                lines += [f"### `{row.get('kernel', row['id'].rsplit('.', 1)[-1])}`", "",
+                          f"定义：`{row.get('definition', '未由目标 tag 源码解析')}`", "",
                           row["reason"], "", "源码证据：" + row["evidence"], ""]
         lines += ["## 未解决项与边界", "", *["- " + item for item in review["unresolved"]], "",
                   "AI 源码复核仍可能遗漏动态路径；未验证 Ascend 实际绑定、数值精度或运行性能。", "",
