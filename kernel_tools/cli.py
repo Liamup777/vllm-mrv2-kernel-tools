@@ -54,7 +54,7 @@ def parser():
     run.add_argument("--rounds", type=int, default=100)
     run.add_argument("--timeout", type=float, default=600)
     run.add_argument("--output", type=Path)
-    run.add_argument("--resume", action="store_true", help="仅本地；需原 --output 和完全相同的输入、源码、环境")
+    run.add_argument("--resume", action="store_true", help="从原 --output 继续；远端会复用已记录的远端结果目录")
     run.add_argument("--expected-source-fingerprint", help=argparse.SUPPRESS)
     run.add_argument("--dry-run", action="store_true", help="只显示计划，不连接设备")
     scan = sub.add_parser("scan", help="调用 AI 和 release-scan skill，核实两个 tag 之间的新增算子")
@@ -69,6 +69,7 @@ def parser():
     scan.add_argument("--reason", "--reasoning-effort", dest="reasoning_effort",
                       help="单次覆盖 Codex model_reasoning_effort，例如 low/medium/high/xhigh")
     scan.add_argument("--ai-timeout", type=float, default=1800)
+    scan.add_argument("--resume", action="store_true", help="从原 --output 重新继续未完成的 AI 复核")
     generate = sub.add_parser("generate", help="读取 scan 结果，调用 AI 生成可独立运行的单算子 case")
     generate.add_argument("--scan", type=Path, required=True, help="scan 输出目录或 review.json")
     generate.add_argument("--repo", type=Path, required=True, help="包含 scan 对应 tag 的本地 vLLM 仓库")
@@ -155,12 +156,10 @@ def main(argv=None):
             output = args.output or new_run_path()
             if args.target:
                 from .remote import load_target, run_remote
-                if args.resume:
-                    raise ValueError("Resume inside the remote container using its retained result directory")
                 target = load_target(args.config, args.target)
                 return run_remote(target, cases, output, device=args.device or target.get("device", "npu:0"),
                                   warmup=args.warmup, rounds=args.rounds, timeout=args.timeout, dry_run=args.dry_run,
-                                  expected_identity=expected_fingerprint)
+                                  expected_identity=expected_fingerprint, resume=args.resume)
             if args.dry_run:
                 print(json.dumps({"cases": [f"{c['kernel']}/{c['name']}" for c in cases],
                                   "cwd": str(args.cwd.resolve()), "device": args.device or "npu:0",
@@ -174,9 +173,12 @@ def main(argv=None):
         elif args.command == "scan":
             from .review import scan_with_ai
             from .runner import new_run_path
+            if args.resume and not args.output:
+                raise ValueError("scan --resume requires the original --output directory")
             return scan_with_ai(args.repo, args.base, args.target, args.output or new_run_path("scans"), scope=args.scope,
                                 config=args.config, codex=args.codex, model=args.model,
-                                reasoning_effort=args.reasoning_effort, ai_timeout=args.ai_timeout)
+                                reasoning_effort=args.reasoning_effort, ai_timeout=args.ai_timeout,
+                                resume=args.resume)
         elif args.command == "generate":
             from .pipeline import generate_from_scan
             from .runner import new_run_path

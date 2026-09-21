@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import traceback
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .ai import REVIEW_SCHEMA, Codex, resolve_codex
@@ -178,17 +179,41 @@ def render_review(root, document):
 
 def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
                  config=None, codex=None, model=None, reasoning_effort=None,
-                 ai_timeout=1800, ai_client=None):
+                 ai_timeout=1800, ai_client=None, resume=False):
     root = Path(output).resolve()
-    if root.exists() and any(root.iterdir()):
+    existing = root / "review.json"
+    if resume:
+        if not existing.is_file():
+            raise ValueError(f"Cannot resume without {existing}")
+        document = json.loads(existing.read_text())
+        expected = {"base": base, "target": target, "scope": scope}
+        actual = {"base": document.get("base", {}).get("tag"),
+                  "target": document.get("target", {}).get("tag"),
+                  "scope": document.get("scope")}
+        mismatch = [key for key in expected if expected[key] != actual[key]]
+        if mismatch:
+            raise ValueError("Resume arguments differ from review.json: " + ", ".join(mismatch))
+        if (document.get("status") in {"reviewed", "needs_review"} and
+                document.get("review_policy_version") == REVIEW_POLICY_VERSION):
+            print(f"[scan] Reusing completed review: {existing}", flush=True)
+            return 1 if document["status"] == "needs_review" else 0
+        document.update(status="running", review_policy_version=REVIEW_POLICY_VERSION,
+                        model=model or document.get("model") or "Codex configured default",
+                        reasoning_effort=reasoning_effort or document.get("reasoning_effort") or
+                        "Codex configured default")
+        document.pop("error", None)
+        document.pop("review", None)
+        document.setdefault("resumes", []).append(datetime.now(timezone.utc).isoformat())
+    elif root.exists() and any(root.iterdir()):
         raise ValueError(f"Scan output already exists: {root}; choose a new directory")
+    else:
+        document = {"schema_version": 1, "status": "running", "scope": scope,
+                    "base": {"tag": base, "commit": None}, "target": {"tag": target, "commit": None},
+                    "validation": "ai_source_review", "complete_inventory": False,
+                    "runtime_coverage": "not_checked", "review_policy_version": REVIEW_POLICY_VERSION,
+                    "model": model or "Codex configured default",
+                    "reasoning_effort": reasoning_effort or "Codex configured default"}
     root.mkdir(parents=True, exist_ok=True)
-    document = {"schema_version": 1, "status": "running", "scope": scope,
-                "base": {"tag": base, "commit": None}, "target": {"tag": target, "commit": None},
-                "validation": "ai_source_review", "complete_inventory": False,
-                "runtime_coverage": "not_checked", "review_policy_version": REVIEW_POLICY_VERSION,
-                "model": model or "Codex configured default",
-                "reasoning_effort": reasoning_effort or "Codex configured default"}
     render_review(root, document)
     try:
         ai = ai_client or Codex(resolve_codex(config, codex), model, ai_timeout, reasoning_effort)

@@ -10,7 +10,7 @@ import tempfile
 import uuid
 from pathlib import Path
 
-from .common import save_json
+from .common import digest, save_json
 
 
 def load_target(config, name):
@@ -106,20 +106,63 @@ def fetch_snapshot(target, destination, *, device="npu:0", failure_log=None):
             raise ValueError(f"Remote source snapshot failed: {error}") from error
 
 
+def remote_run_active(target, remote_output):
+    """Check /proc inside the target runtime for this exact runner output."""
+    script = (
+        "import os\n"
+        f"needle = b'--output\\0' + {remote_output!r}.encode() + b'\\0'\n"
+        "found = []\n"
+        "for name in os.listdir('/proc') if os.path.isdir('/proc') else []:\n"
+        "    if not name.isdigit() or int(name) == os.getpid():\n"
+        "        continue\n"
+        "    try:\n"
+        "        data = open('/proc/' + name + '/cmdline', 'rb').read()\n"
+        "    except OSError:\n"
+        "        continue\n"
+        "    if needle in data:\n"
+        "        found.append(name)\n"
+        "print(','.join(found))\n"
+    )
+    command = target_command(target, [target["python"], "-c", script], setup_stderr=True)
+    result = checked_ssh(target, command, capture_output=True, text=True, timeout=30)
+    return bool(result.stdout.strip())
+
+
 def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
-               timeout=600, dry_run=False, doctor=False, expected_identity=None):
+               timeout=600, dry_run=False, doctor=False, expected_identity=None,
+               resume=False):
     output = Path(output).resolve()
-    if not doctor and output.exists() and any(output.iterdir()):
+    manifest_path = output / "remote-run.json"
+    tool_hash = digest({p.name: p.read_text() for p in Path(__file__).parent.glob("*.py")})
+    run_identity = digest({
+        "cases": cases,
+        "target": {key: target.get(key) for key in
+                   ("host", "container", "python", "cwd", "pythonpath", "setup", "result_root", "env")},
+        "device": device, "warmup": warmup, "rounds": rounds, "timeout": timeout,
+        "expected_identity": expected_identity, "tool_hash": tool_hash,
+    })
+    manifest = None
+    if not doctor and resume:
+        if not manifest_path.is_file():
+            raise ValueError(f"Cannot resume remote run without {manifest_path}")
+        manifest = json.loads(manifest_path.read_text())
+        if manifest.get("run_identity") != run_identity:
+            raise ValueError("Remote resume refused: cases, target, tool, source fingerprint, or run settings changed")
+        remote_output = manifest["remote_output"]
+    elif not doctor and output.exists() and any(output.iterdir()):
         raise ValueError(f"Output already exists: {output}")
     token = uuid.uuid4().hex
     stage = "/tmp/kernel-tools-" + token
-    remote_output = target["result_root"].rstrip("/") + "/" + output.name + "-" + token[:6]
+    if not doctor and not resume:
+        remote_output = target["result_root"].rstrip("/") + "/" + output.name + "-" + token[:6]
     argv = [target["python"], "-m", "kernel_tools"]
     if doctor:
         argv += ["doctor", "--device", device]
     else:
         argv += ["run", stage + "/input.json", "--cwd", target["cwd"], "--output", remote_output,
                  "--device", device, "--warmup", str(warmup), "--rounds", str(rounds), "--timeout", str(timeout)]
+        if resume:
+            argv.append("--resume")
         for path in target.get("pythonpath", []):
             argv += ["--pythonpath", path]
         if expected_identity:
@@ -130,6 +173,15 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
                           "command": command, "download_to": str(output),
                           "note": "No SSH connection or NPU execution performed"}, ensure_ascii=False, indent=2))
         return 0
+    if not doctor and resume and remote_run_active(target, remote_output):
+        raise ValueError(f"Remote run is still active for {remote_output}; wait for it to finish before --resume")
+    if not doctor:
+        output.mkdir(parents=True, exist_ok=True)
+        manifest = manifest or {"schema_version": 1, "remote_output": remote_output,
+                                "run_identity": run_identity, "attempts": 0}
+        manifest.update(status="launching", attempts=manifest.get("attempts", 0) + 1,
+                        last_stage=stage)
+        save_json(manifest_path, manifest)
     staged = False
     try:
         with tempfile.TemporaryDirectory(prefix="kernel-tools-upload-") as tmp:
@@ -151,7 +203,11 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             if doctor:
                 return result.returncode
             if result.returncode == 255:
+                manifest.update(status="connection_lost")
+                save_json(manifest_path, manifest)
                 raise ValueError(f"SSH interrupted. Do not restart blindly; inspect remote processes and {remote_output}")
+            manifest.update(status="remote_finished", returncode=result.returncode)
+            save_json(manifest_path, manifest)
             print(f"Remote results retained: {remote_output}", flush=True)
             archive_path = Path(tmp) / "results.tar"
             collect = ["tar", "-cf", "-", "-C", remote_output, "."]
@@ -162,6 +218,8 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             output.mkdir(parents=True, exist_ok=True)
             with tarfile.open(archive_path) as archive:
                 safe_extract(archive, output)
+            manifest.update(status="downloaded", returncode=result.returncode)
+            save_json(manifest_path, manifest)
             print(f"Local report: {output / 'report.md'}", flush=True)
             return result.returncode
     finally:

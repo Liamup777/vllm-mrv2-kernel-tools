@@ -286,6 +286,61 @@ class TransportTest(unittest.TestCase):
             result = json.loads(next((root / "download/results").glob("*.json")).read_text())
             self.assertEqual(result["scenarios"][0]["status"], "blocked")
 
+    def test_remote_resume_reuses_recorded_remote_output(self):
+        import venv
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.mkdir()
+            subprocess.run(["git", "-C", str(source), "init", "-q"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.email", "test@example.invalid"], check=True)
+            subprocess.run(["git", "-C", str(source), "config", "user.name", "Test"], check=True)
+            (source / "tracked").write_text("fixture\n")
+            subprocess.run(["git", "-C", str(source), "add", "."], check=True)
+            subprocess.run(["git", "-C", str(source), "commit", "-qm", "fixture"], check=True)
+            venv.EnvBuilder(with_pip=False).create(root / "python")
+            target = {"host": "simulated", "cwd": str(source),
+                      "python": str(root / "python/bin/python"), "result_root": str(root / "remote")}
+            output = root / "download"
+            with patch("kernel_tools.remote.ssh_command", side_effect=lambda t, c: ["bash", "-c", c]):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(run_remote(target, [case()], output), 1)
+                    remote_output = json.loads((output / "remote-run.json").read_text())["remote_output"]
+                    self.assertEqual(run_remote(target, [case()], output, resume=True), 1)
+            manifest = json.loads((output / "remote-run.json").read_text())
+            self.assertEqual(manifest["remote_output"], remote_output)
+            self.assertEqual(manifest["attempts"], 2)
+            self.assertEqual(manifest["status"], "downloaded")
+
+    def test_remote_resume_refuses_changed_input(self):
+        import venv
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv.EnvBuilder(with_pip=False).create(root / "python")
+            target = {"host": "simulated", "cwd": str(root),
+                      "python": str(root / "python/bin/python"), "result_root": str(root / "remote")}
+            output = root / "download"
+            with patch("kernel_tools.remote.ssh_command", side_effect=lambda t, c: ["bash", "-c", c]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run_remote(target, [case()], output), 1)
+                with self.assertRaisesRegex(ValueError, "cases, target, tool"):
+                    run_remote(target, [case("changed")], output, resume=True)
+
+    def test_remote_resume_refuses_while_original_process_is_active(self):
+        import venv
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            venv.EnvBuilder(with_pip=False).create(root / "python")
+            target = {"host": "simulated", "cwd": str(root),
+                      "python": str(root / "python/bin/python"), "result_root": str(root / "remote")}
+            output = root / "download"
+            with patch("kernel_tools.remote.ssh_command", side_effect=lambda t, c: ["bash", "-c", c]), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(run_remote(target, [case()], output), 1)
+            with patch("kernel_tools.remote.remote_run_active", return_value=True):
+                with self.assertRaisesRegex(ValueError, "still active"):
+                    run_remote(target, [case()], output, resume=True)
+
     def test_command_quotes_paths_and_values(self):
         target = {"cwd": "/source/a b", "container": "vllm", "pythonpath": ["/source/a b"],
                   "setup": "/opt/a b/setup.sh", "env": {"VALUE": "$(false); x"}}

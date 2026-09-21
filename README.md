@@ -18,7 +18,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
 
 首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划。默认使用本机 Codex 模型和推理强度配置；`--model` 与 `--reason` 可为单次运行覆盖。详见 [完整流程说明](docs/pipeline.md)。
 
-运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。中断或前置检查阻塞后，用相同命令和输出目录追加 `--resume`；已完成的 AI 复核与源码指纹一致的 case 会被复用。
+运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。`scan`、`generate`、`run` 和 `pipeline` 都支持在原 `--output` 上追加 `--resume`；完成项会在身份校验通过后复用。
 
 生成的用例默认保存在本次运行目录的 `cases/` 中；使用 `--cases-output ~/vllm-kernel-cases/v0.29.0` 可指定独立目录。`--output` 仍指定整次运行的报告目录。未设置输出目录时，macOS 默认写入 `~/Library/Application Support/vllm-kernel-tools/`，不会在工具仓库生成运行文件；其他系统使用各自的用户数据目录。可通过 `VLLM_KERNEL_TOOLS_HOME` 改写根目录。
 
@@ -214,7 +214,7 @@ python -m kernel_tools run examples/fill_num_accepted.json \
 
 支持输入一个目录运行其中所有 `.json` / `.jsonl` case，支持 `--kernel` 和 `--case-name` 精确筛选。失败不会中止后续 case；Ctrl-C 会记录当前中断并把剩余项标为 blocked。设备环境不可用时所有选中 case 都有 blocked 结果。
 
-本地断点续跑：使用完全相同的命令与 `--output`，追加 `--resume`。只有已成功项被复用，失败项重跑。源码需为干净 Git checkout；case、源码 HEAD、工具代码、环境或测量参数发生变化时拒绝复用。远端续跑需进入容器，从保留的结果目录继续；SSH 断开后先确认原进程状态，避免重复启动。
+断点续跑使用完全相同的命令与 `--output`，追加 `--resume`。本地和 `--target` 远端运行都会复用成功项，只重跑未完成或失败 case。远端首次运行在本地输出目录保存 `remote-run.json`，恢复时复用其中的远端结果目录；若原远端进程仍在运行则拒绝重复启动。case、目标配置、工具代码、源码指纹或测量参数发生变化时拒绝复用。没有生成时源码指纹的手写 case 仍要求源码 Git 根目录干净。
 
 ## 结果只有需要的东西
 
@@ -237,6 +237,8 @@ python -m kernel_tools scan --repo ../vllm \
 ```
 
 `scan` 自动调用 Codex 和 release-scan skill，只分析源码，不连接 NPU。控制端需要可用且已登录的 Codex CLI；可读取 `kernel-tools.json` 的 `ai.codex`，无需配置 NPU 目标。
+
+扫描失败或中断后，可使用相同参数、原输出目录并追加 `--resume`。已完成的 review 直接复用；未完成的单次 AI review 会重新发起，因为 Codex 调用本身没有可恢复的中间状态。
 
 输出 `review.md` 和 `review.json`。报告分别列出 AI 确认新增、待核实和已有/非新增项，不把已有算子的变化混入新增数。静态 AST 候选只作为内部辅助；读取精确 tag，不切换源码分支。
 

@@ -356,6 +356,26 @@ class ReviewCommandTest(unittest.TestCase):
         self.assertIn("omitted candidates", report["error"])
         self.assertTrue((f.output / "logs/scan.log").is_file())
 
+    def test_scan_resume_retries_failed_review_and_reuses_completed_review(self):
+        from kernel_tools.review import scan_with_ai
+        f = self.fixture
+        f.ai.omit = True
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", f.output,
+                                          ai_client=f.ai), 1)
+        f.ai.omit = False
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", f.output,
+                                          ai_client=f.ai, resume=True), 0)
+        calls = len(f.ai.calls)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", f.output,
+                                          ai_client=f.ai, resume=True), 0)
+        self.assertEqual(len(f.ai.calls), calls)
+        report = json.loads((f.output / "review.json").read_text())
+        self.assertEqual(report["status"], "reviewed")
+        self.assertEqual(len(report["resumes"]), 1)
+
     def test_cli_scan_routes_to_ai(self):
         from kernel_tools.cli import main
         with patch("kernel_tools.review.scan_with_ai", return_value=0) as review:

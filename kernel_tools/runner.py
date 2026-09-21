@@ -227,8 +227,9 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
                "isolation": "cooperative_lock_only"}
     tool_hash = digest({p.name: p.read_text() for p in Path(__file__).parent.glob("*.py")})
     signature = digest({"cases": cases, "context": context, "tool_hash": tool_hash})
-    if resume and any(s["dirty"] is not False for s in [*sources, *imported_sources.values()]):
-        raise ValueError("Resume requires clean Git source roots; start a new output directory for dirty/unversioned sources")
+    if (resume and not expected_identity and
+            any(s["dirty"] is not False for s in [*sources, *imported_sources.values()])):
+        raise ValueError("Resume of dirty/unversioned sources requires a generated case source fingerprint")
     if output.exists() and any(output.iterdir()) and not resume:
         raise ValueError(f"Output already exists: {output}; choose a new path or use --resume")
     output.mkdir(parents=True, exist_ok=True)

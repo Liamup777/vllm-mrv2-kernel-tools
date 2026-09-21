@@ -13,7 +13,7 @@ python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
   --target npu162 --output ~/kernel-results/run-029
 ```
 
-`scan` 只读本地精确 tag 并完成 AI release review。`generate` 消费其输出目录或其中的 `review.json`，不会再次调用 release review；它会重新验证 tag、commit、扫描范围和 AST 候选，读取远端真实源码，然后逐算子生成 case。`run` 消费 case，自动使用其中保存的远端源码指纹，防止生成后环境变化。三个输出目录互相独立，任一步失败都可使用该步骤自己的 `--resume` 方式继续；`scan` 失败时重新运行到一个新目录。
+`scan` 只读本地精确 tag 并完成 AI release review。`generate` 消费其输出目录或其中的 `review.json`，不会再次调用 release review；它会重新验证 tag、commit、扫描范围和 AST 候选，读取远端真实源码，然后逐算子生成 case。`run` 消费 case，自动使用其中保存的远端源码指纹，防止生成后环境变化。三个输出目录互相独立，任一步失败都可使用该步骤自己的 `--resume` 方式继续。`scan` 的未完成 AI 调用会重新发起；远端 `run` 会先确认原进程没有继续运行，再复用首次运行记录的远端结果目录。
 
 也可以用一条命令完成相同流程：
 
