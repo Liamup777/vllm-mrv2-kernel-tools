@@ -102,7 +102,7 @@ def render_pipeline(root, state, execution_report=""):
 
 
 def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/gpu",
-             codex=None, model=None, ai_timeout=1800, device=None,
+             codex=None, model=None, reasoning_effort=None, ai_timeout=1800, device=None,
              warmup=10, rounds=100, timeout=600, prepare_only=False,
              dry_run=False, ai_client=None, cases_output=None, resume=False):
     target_config = load_target(config, npu)
@@ -135,7 +135,7 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                              cases_dir.relative_to(root).parts[0] in {"adapters", "results", "logs"}):
         raise ValueError("--cases-output must be a separate case directory")
     if dry_run:
-        ai_plan = describe_codex(configured_codex, model, ai_timeout)
+        ai_plan = describe_codex(configured_codex, model, ai_timeout, reasoning_effort)
         print(json.dumps({"base": base, "target": target, "npu": npu, "device": device,
             "steps": ["scan", "reuse AI review" if resume and prior.get("review") else "AI review with release skill", "read actual NPU sources",
                       "AI JSON cases with case skill", "validate",
@@ -169,14 +169,18 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
         persist()
     persist()
     try:
-        ai = ai_client or Codex(configured_codex, model, ai_timeout)
+        ai = ai_client or Codex(configured_codex, model, ai_timeout, reasoning_effort)
         state["ai"] = (ai.description() if hasattr(ai, "description") else {
             "executable": configured_codex, "model": model or "test/configured AI",
-            "model_source": "injected/configured", "reasoning_effort": None,
+            "model_source": "injected/configured",
+            "reasoning_effort": reasoning_effort or "injected/configured",
+            "reasoning_effort_source": "injected/configured",
             "timeout_seconds": ai_timeout})
         state["model"] = state["ai"]["model"]
         print(f"[pipeline] output={root}", flush=True)
         print(f"[pipeline] AI model={state['ai']['model']} ({state['ai']['model_source']}), "
+              f"reasoning={state['ai']['reasoning_effort']} "
+              f"({state['ai'].get('reasoning_effort_source', 'Codex config')}), "
               f"executable={state['ai']['executable']}", flush=True)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-pipeline-") as tmp:
             workspace = Path(tmp)

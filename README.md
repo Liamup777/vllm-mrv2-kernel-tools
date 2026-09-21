@@ -15,7 +15,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
   --base v0.28.0 --target v0.29.0 --npu npu165
 ```
 
-首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划；加 `--prepare-only` 会调用 AI 并读取远端源码，生成用例后停止。默认使用本机 Codex 模型配置；`--model` 可覆盖。详见 [完整流程说明](docs/pipeline.md)。
+首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划；加 `--prepare-only` 会调用 AI 并读取远端源码，生成用例后停止。默认使用本机 Codex 模型和推理强度配置；`--model` 与 `--reason` 可为单次运行覆盖。详见 [完整流程说明](docs/pipeline.md)。
 
 运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。中断或前置检查阻塞后，用相同命令和输出目录追加 `--resume`；已完成的 AI 复核与源码指纹一致的 case 会被复用。
 

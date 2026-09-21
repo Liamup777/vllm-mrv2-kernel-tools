@@ -32,7 +32,7 @@ CASE_SCHEMA = object_schema({
 DIAGNOSIS_SCHEMA = object_schema({"analysis": STRING})
 
 
-def describe_codex(executable, model=None, timeout=1800):
+def describe_codex(executable, model=None, timeout=1800, reasoning_effort=None):
     configured = {}
     config = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
     try:
@@ -43,7 +43,8 @@ def describe_codex(executable, model=None, timeout=1800):
         "executable": str(executable),
         "model": model or configured.get("model") or "Codex configured default",
         "model_source": "command line" if model else "Codex config",
-        "reasoning_effort": configured.get("model_reasoning_effort") if not model else None,
+        "reasoning_effort": reasoning_effort or configured.get("model_reasoning_effort") or "Codex configured default",
+        "reasoning_effort_source": "command line" if reasoning_effort else "Codex config",
         "timeout_seconds": timeout,
     }
 
@@ -82,17 +83,18 @@ def validate_schema(value, schema, path="response"):
 
 
 class Codex:
-    def __init__(self, executable="codex", model=None, timeout=1800):
+    def __init__(self, executable="codex", model=None, timeout=1800, reasoning_effort=None):
         self.executable = shutil.which(executable)
         if not self.executable:
             raise ValueError(f"Codex CLI not found: {executable}; install it and sign in first")
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("AI timeout must be finite and positive")
         self.model, self.timeout = model, timeout
+        self.reasoning_effort = reasoning_effort
 
     def description(self):
         """Return the effective user-visible AI settings without invoking Codex."""
-        return describe_codex(self.executable, self.model, self.timeout)
+        return describe_codex(self.executable, self.model, self.timeout, self.reasoning_effort)
 
     def ask(self, prompt, schema, *, workspace, failure_log, label="AI task"):
         """Retain full failed CLI output, discard successful event chatter."""
@@ -107,9 +109,12 @@ class Codex:
                        "--output-schema", str(spec), "--output-last-message", str(result)]
             if self.model:
                 command += ["--model", self.model]
+            if self.reasoning_effort:
+                command += ["--config", "model_reasoning_effort=" + json.dumps(self.reasoning_effort)]
             command += ["-"]
-            shown_model = self.description()["model"]
-            print(f"[ai] start: {label}; model={shown_model}; prompt={len(prompt)} chars; "
+            description = self.description()
+            print(f"[ai] start: {label}; model={description['model']}; "
+                  f"reasoning={description['reasoning_effort']}; prompt={len(prompt)} chars; "
                   f"timeout={self.timeout:g}s", flush=True)
             started = time.monotonic()
             try:

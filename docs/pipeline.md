@@ -11,7 +11,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
 
 ## 首次准备
 
-1. 控制端安装并登录 Codex CLI，确认 `codex --version` 和 `codex login status` 可用。工具复用其认证、模型和供应商配置；实际 AI 调用会使用相应账户额度。可用 `--codex /path/to/codex` 或 `--model MODEL` 指定入口或模型。启动时会打印实际 CLI、模型和模型来源；每次 AI 调用打印用途、提示词长度、超时和耗时，超过 30 秒时持续输出心跳。
+1. 控制端安装并登录 Codex CLI，确认 `codex --version` 和 `codex login status` 可用。工具复用其认证、模型和供应商配置；实际 AI 调用会使用相应账户额度。可用 `--codex /path/to/codex`、`--model MODEL` 和 `--reason high` 指定入口、模型与单次推理强度。`--reasoning-effort` 是 `--reason` 的完整别名；未设置时沿用 `~/.codex/config.toml` 的 `model_reasoning_effort`。启动时会打印实际 CLI、模型、推理强度及其来源；每次 AI 调用打印用途、提示词长度、超时和耗时，超过 30 秒时持续输出心跳。
 2. 本地 `--repo` 仓库中已有两个指定 tag。扫描不自动拉取 tag。
 3. 配置远端 SSH 密钥登录、容器、Python、源码目录和设备，先运行 `python3 -m kernel_tools doctor --target npu165`。使用已分配且可用的设备；工具的协作锁不代表外部任务没有占卡。
 4. 远端已安装适用的 Torch/torch_npu/Triton/CANN 和 vLLM/vLLM-Ascend。工具不替你安装或切换这些环境。

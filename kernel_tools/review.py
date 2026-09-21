@@ -133,7 +133,8 @@ def render_review(root, document):
 
 
 def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
-                 config=None, codex=None, model=None, ai_timeout=1800, ai_client=None):
+                 config=None, codex=None, model=None, reasoning_effort=None,
+                 ai_timeout=1800, ai_client=None):
     root = Path(output).resolve()
     if root.exists() and any(root.iterdir()):
         raise ValueError(f"Scan output already exists: {root}; choose a new directory")
@@ -142,10 +143,11 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
                 "base": {"tag": base, "commit": None}, "target": {"tag": target, "commit": None},
                 "validation": "ai_source_review", "complete_inventory": False,
                 "runtime_coverage": "not_checked", "review_policy_version": REVIEW_POLICY_VERSION,
-                "model": model or "Codex configured default"}
+                "model": model or "Codex configured default",
+                "reasoning_effort": reasoning_effort or "Codex configured default"}
     render_review(root, document)
     try:
-        ai = ai_client or Codex(resolve_codex(config, codex), model, ai_timeout)
+        ai = ai_client or Codex(resolve_codex(config, codex), model, ai_timeout, reasoning_effort)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-review-") as tmp:
             workspace = Path(tmp)
             print("[scan] Preparing exact tag sources and candidate hints", flush=True)

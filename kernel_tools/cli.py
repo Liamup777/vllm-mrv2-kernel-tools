@@ -66,6 +66,8 @@ def parser():
     scan.add_argument("--config", type=Path, default=Path("kernel-tools.json"), help="可选；仅读取 ai 配置，不需要 NPU 配置")
     scan.add_argument("--codex", help="Codex CLI 路径；默认读配置 ai.codex 或 PATH")
     scan.add_argument("--model", help="默认使用 Codex 配置的模型")
+    scan.add_argument("--reason", "--reasoning-effort", dest="reasoning_effort",
+                      help="单次覆盖 Codex model_reasoning_effort，例如 low/medium/high/xhigh")
     scan.add_argument("--ai-timeout", type=float, default=1800)
     flow = sub.add_parser("pipeline", help="扫描新增算子 → 调用 AI 生成用例 → NPU 执行与报告")
     flow.add_argument("--repo", type=Path, required=True)
@@ -78,6 +80,8 @@ def parser():
     flow.add_argument("--scope", default="vllm/v1/worker/gpu")
     flow.add_argument("--codex", help="Codex CLI 可执行文件；默认读配置 ai.codex 或 PATH")
     flow.add_argument("--model", help="AI 模型；默认使用本机 Codex 配置")
+    flow.add_argument("--reason", "--reasoning-effort", dest="reasoning_effort",
+                      help="单次覆盖 Codex model_reasoning_effort，例如 low/medium/high/xhigh")
     flow.add_argument("--ai-timeout", type=float, default=1800, help="每次 AI 调用的秒数上限")
     flow.add_argument("--device")
     flow.add_argument("--warmup", type=int, default=10)
@@ -147,7 +151,8 @@ def main(argv=None):
             from .review import scan_with_ai
             from .runner import new_run_path
             return scan_with_ai(args.repo, args.base, args.target, args.output or new_run_path("scans"), scope=args.scope,
-                                config=args.config, codex=args.codex, model=args.model, ai_timeout=args.ai_timeout)
+                                config=args.config, codex=args.codex, model=args.model,
+                                reasoning_effort=args.reasoning_effort, ai_timeout=args.ai_timeout)
         elif args.command == "pipeline":
             from .pipeline import pipeline
             from .runner import new_run_path
@@ -155,7 +160,8 @@ def main(argv=None):
                 raise ValueError("pipeline --resume requires the original --output directory")
             return pipeline(args.repo, args.base, args.target, args.npu, args.config,
                             args.output or new_run_path(), scope=args.scope, codex=args.codex,
-                            model=args.model, ai_timeout=args.ai_timeout, device=args.device,
+                            model=args.model, reasoning_effort=args.reasoning_effort,
+                            ai_timeout=args.ai_timeout, device=args.device,
                             warmup=args.warmup, rounds=args.rounds, timeout=args.timeout,
                             prepare_only=args.prepare_only, dry_run=args.dry_run,
                             cases_output=args.cases_output, resume=args.resume)
