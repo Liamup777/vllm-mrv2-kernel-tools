@@ -16,7 +16,8 @@ from .cases import validate_cases
 from .common import file_key, save_json
 from .remote import fetch_snapshot, load_target, run_remote
 from .scan import Module, write_scan
-from .review import REVIEW_POLICY_VERSION, instructions, resource_root, write_sources, review_sources
+from .review import (REVIEW_POLICY_VERSION, instructions, load_scan_result,
+                     resource_root, review_sources, write_sources)
 
 
 CASE_POLICY_VERSION = 3
@@ -104,7 +105,8 @@ def render_pipeline(root, state, execution_report=""):
 def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/gpu",
              codex=None, model=None, reasoning_effort=None, ai_timeout=1800, device=None,
              warmup=10, rounds=100, timeout=600, prepare_only=False,
-             dry_run=False, ai_client=None, cases_output=None, resume=False):
+             dry_run=False, ai_client=None, cases_output=None, resume=False,
+             scan_input=None):
     target_config = load_target(config, npu)
     configured_codex = resolve_codex(config, codex)
     device = device or target_config.get("device", "npu:0")
@@ -137,7 +139,8 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
     if dry_run:
         ai_plan = describe_codex(configured_codex, model, ai_timeout, reasoning_effort)
         print(json.dumps({"base": base, "target": target, "npu": npu, "device": device,
-            "steps": ["scan", "reuse AI review" if resume and prior.get("review") else "AI review with release skill", "read actual NPU sources",
+            "steps": ["verify reusable scan result" if scan_input else "scan",
+                      "reuse AI review" if scan_input or (resume and prior.get("review")) else "AI review with release skill", "read actual NPU sources",
                       "AI JSON cases with case skill", "validate",
                       "stop after generation" if prepare_only else "NPU run and failure analysis"],
             "AI": {**ai_plan, "command": [configured_codex, "exec"]},
@@ -191,7 +194,27 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
             after = json.loads((workspace / "scan/target.json").read_text())
             write_sources(repo, base, workspace / "base")
             commit, target_sources = write_sources(repo, target, workspace / "target")
-            if (resume and state.get("review") and
+            if scan_input:
+                scan_file, scan_document = load_scan_result(scan_input)
+                expected_scan = {
+                    "base tag": (scan_document["base"]["tag"], base),
+                    "base commit": (scan_document["base"]["commit"], delta["base"]["commit"]),
+                    "target tag": (scan_document["target"]["tag"], target),
+                    "target commit": (scan_document["target"]["commit"], delta["target"]["commit"]),
+                    "scope": (scan_document.get("scope"), scope),
+                }
+                mismatch = [name for name, (actual_value, expected_value) in expected_scan.items()
+                            if actual_value != expected_value]
+                if mismatch:
+                    raise ValueError("Scan result differs from requested sources: " + ", ".join(mismatch))
+                review = scan_document["review"]
+                from .review import validate_review
+                validate_review(review, delta, target_sources, before)
+                state["review"] = review
+                state["review_policy_version"] = REVIEW_POLICY_VERSION
+                state["scan_source"] = str(scan_file)
+                stage("Reuse independent scan result", "2/6")
+            elif (resume and state.get("review") and
                     state.get("review_policy_version") == REVIEW_POLICY_VERSION):
                 review = state["review"]
                 from .review import validate_review
@@ -379,3 +402,11 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
         return 130 if isinstance(error, KeyboardInterrupt) else 1
     finally:
         print(f"Report: {root / 'report.md'}", flush=True)
+
+
+def generate_from_scan(scan_input, repo, npu, config, output, **kwargs):
+    """Generate reusable direct-Triton cases from a completed scan artifact."""
+    _, document = load_scan_result(scan_input)
+    return pipeline(repo, document["base"]["tag"], document["target"]["tag"],
+                    npu, config, output, scope=document["scope"],
+                    prepare_only=True, scan_input=scan_input, **kwargs)

@@ -43,6 +43,24 @@ def write_sources(repo, tag, destination):
     return commit, files
 
 
+def load_scan_result(path):
+    """Load a reusable result produced by ``kernel-tools scan``."""
+    path = Path(path).resolve()
+    file = path / "review.json" if path.is_dir() else path
+    if not file.is_file():
+        raise ValueError(f"Scan result not found: {file}")
+    document = json.loads(file.read_text())
+    if document.get("status") not in {"reviewed", "needs_review"} or not document.get("review"):
+        raise ValueError("Scan result is not a completed AI review")
+    if document.get("review_policy_version") != REVIEW_POLICY_VERSION:
+        raise ValueError("Scan result uses an incompatible review policy; run scan again")
+    for side in ("base", "target"):
+        value = document.get(side)
+        if not isinstance(value, dict) or not all(value.get(k) for k in ("tag", "commit")):
+            raise ValueError(f"Scan result lacks {side} tag/commit identity")
+    return file, document
+
+
 def resolve_target_definition(identity, target_sources):
     """Resolve an AI-returned identity against authoritative target-tag ASTs."""
     parts = identity.split(".")

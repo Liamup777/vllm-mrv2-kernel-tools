@@ -3,6 +3,7 @@
 一个用于 vLLM MRV2 Triton 版本检查和 Ascend 单算子测试的小工具。
 
 - 一条 `pipeline` 命令串联版本扫描、Codex/skill 用例生成、NPU 执行和失败分析。
+- `scan`、`generate`、`run` 也可分别执行；每一步直接消费上一步的持久化产物。
 - 使用 JSON/JSONL case 直接执行 `kernel[grid](...)`，只测 Triton kernel 本体。
 - 一条命令按算子或 case 筛选、运行、汇总；失败保存完整日志。
 - 从指定 Git tag 扫描静态候选并比较版本，不切换被测仓库的分支。
@@ -15,13 +16,26 @@ python3 -m kernel_tools pipeline --repo ../vllm \
   --base v0.28.0 --target v0.29.0 --npu npu165
 ```
 
-首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划；加 `--prepare-only` 会调用 AI 并读取远端源码，生成用例后停止。默认使用本机 Codex 模型和推理强度配置；`--model` 与 `--reason` 可为单次运行覆盖。详见 [完整流程说明](docs/pipeline.md)。
+首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划。默认使用本机 Codex 模型和推理强度配置；`--model` 与 `--reason` 可为单次运行覆盖。详见 [完整流程说明](docs/pipeline.md)。
 
 运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。中断或前置检查阻塞后，用相同命令和输出目录追加 `--resume`；已完成的 AI 复核与源码指纹一致的 case 会被复用。
 
 生成的用例默认保存在本次运行目录的 `cases/` 中；使用 `--cases-output ~/vllm-kernel-cases/v0.29.0` 可指定独立目录。`--output` 仍指定整次运行的报告目录。未设置输出目录时，macOS 默认写入 `~/Library/Application Support/vllm-kernel-tools/`，不会在工具仓库生成运行文件；其他系统使用各自的用户数据目录。可通过 `VLLM_KERNEL_TOOLS_HOME` 改写根目录。
 
-`scan` 通过 `codex exec` 调用 AI 和 release-scan skill 核实新增算子；`pipeline` 在相同扫描阶段后继续生成用例和运行测试。新增算子有无法确定的输入或 reference 时，报告 blocked 并继续其他算子。
+三个阶段也可以独立执行：
+
+```bash
+python3 -m kernel_tools scan --repo ../vllm \
+  --base v0.28.0 --target v0.29.0 --output ~/kernel-results/scan-029
+
+python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
+  --repo ../vllm --npu npu162 --output ~/kernel-results/generate-029
+
+python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
+  --target npu162 --output ~/kernel-results/run-029
+```
+
+`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它仍会用固定代码核对 tag、commit、范围和候选，并读取远端实际源码。`run` 会自动读取生成 case 中的远端源码指纹，环境发生变化时拒绝执行。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 
 ## 最快开始
 

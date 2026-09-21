@@ -363,6 +363,36 @@ class ReviewCommandTest(unittest.TestCase):
                                    "--output", "unused"]), 0)
             review.assert_called_once()
 
+    def test_generate_reuses_scan_result_without_second_release_review(self):
+        from kernel_tools.pipeline import generate_from_scan
+        from kernel_tools.review import scan_with_ai
+        f = self.fixture
+        scan_output = f.root / "scan"
+        generation_output = f.root / "generation"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", scan_output,
+                                          ai_client=f.ai), 0)
+        self.assertEqual(len(f.ai.calls), 1)
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
+             patch("kernel_tools.pipeline.run_remote") as remote, \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(generate_from_scan(scan_output, f.repo, "test", f.config,
+                                                generation_output, ai_client=f.ai), 0)
+            remote.assert_not_called()
+        self.assertEqual(len(f.ai.calls), 2)
+        self.assertEqual(f.ai.calls[1][1], CASE_SCHEMA)
+        state = json.loads((generation_output / "workflow.json").read_text())
+        self.assertEqual(state["status"], "prepared")
+        self.assertEqual(Path(state["scan_source"]), (scan_output / "review.json").resolve())
+        self.assertEqual(len(list((generation_output / "cases").glob("*.json"))), 1)
+
+    def test_cli_generate_routes_completed_scan(self):
+        from kernel_tools.cli import main
+        with patch("kernel_tools.pipeline.generate_from_scan", return_value=0) as generate:
+            self.assertEqual(main(["generate", "--scan", "scan-output", "--repo", ".",
+                                   "--npu", "test", "--output", "generation-output"]), 0)
+            generate.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

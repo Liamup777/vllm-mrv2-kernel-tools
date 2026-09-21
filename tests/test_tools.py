@@ -82,6 +82,18 @@ class CasesTest(unittest.TestCase):
             target = resolve_target(str(file) + ":kernel")
             self.assertEqual(target[(2,)], (2,))
 
+    def test_remote_run_uses_fingerprint_stored_in_generated_case(self):
+        from kernel_tools.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            input_file = Path(tmp) / "case.json"
+            generated = case()
+            generated["source"] = {"runtime_fingerprint": "abc123"}
+            input_file.write_text(json.dumps([generated]))
+            with patch("kernel_tools.remote.load_target", return_value={"device": "npu:0"}), \
+                 patch("kernel_tools.remote.run_remote", return_value=0) as remote:
+                self.assertEqual(main(["run", str(input_file), "--target", "test"]), 0)
+            self.assertEqual(remote.call_args.kwargs["expected_identity"], "abc123")
+
 
 FAKE_WORKER = r'''
 import argparse, json, time

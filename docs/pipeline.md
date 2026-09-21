@@ -1,4 +1,21 @@
-# 一条命令完成新增算子测试
+# 三个独立阶段或一条 pipeline
+
+完整工作流由三个可独立执行的阶段组成：
+
+```bash
+python3 -m kernel_tools scan --repo ../vllm \
+  --base v0.28.0 --target v0.29.0 --output ~/kernel-results/scan-029
+
+python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
+  --repo ../vllm --npu npu162 --output ~/kernel-results/generate-029
+
+python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
+  --target npu162 --output ~/kernel-results/run-029
+```
+
+`scan` 只读本地精确 tag 并完成 AI release review。`generate` 消费其输出目录或其中的 `review.json`，不会再次调用 release review；它会重新验证 tag、commit、扫描范围和 AST 候选，读取远端真实源码，然后逐算子生成 case。`run` 消费 case，自动使用其中保存的远端源码指纹，防止生成后环境变化。三个输出目录互相独立，任一步失败都可使用该步骤自己的 `--resume` 方式继续；`scan` 失败时重新运行到一个新目录。
+
+也可以用一条命令完成相同流程：
 
 ```bash
 python3 -m kernel_tools pipeline --repo ../vllm \
@@ -25,7 +42,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
   --base v0.28.0 --target v0.29.0 --npu npu165 --dry-run
 ```
 
-只生成用例、暂不执行算子：
+兼容原有用法时，也可以让 pipeline 生成用例后停止：
 
 ```bash
 python3 -m kernel_tools pipeline --repo ../vllm \
@@ -33,7 +50,7 @@ python3 -m kernel_tools pipeline --repo ../vllm \
   --prepare-only --output artifacts/prepared-029
 ```
 
-这会调用 AI，并连接 NPU 环境读取软件信息和 Python 源码；不会启动 case。查看产物后，也可通过 `run artifacts/prepared-029/cases --target npu165` 手动运行。普通 `run` 不自动核对生成时的源码指纹，重新运行前需确认环境未变。
+这会调用 AI，并连接 NPU 环境读取软件信息和 Python 源码；不会启动 case。新流程更推荐显式使用 `scan` 后接 `generate`。查看产物后，也可通过 `run artifacts/prepared-029/cases --target npu165` 手动运行；`run` 会自动核对 case 中保存的源码指纹。
 
 想把用例单独放在固定位置，可以在上面的命令中加 `--cases-output ~/vllm-kernel-cases/v0.29.0`；之后手动运行用 `run ~/vllm-kernel-cases/v0.29.0 --target npu165`。
 
