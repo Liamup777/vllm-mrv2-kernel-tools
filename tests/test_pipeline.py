@@ -373,16 +373,22 @@ class ReviewCommandTest(unittest.TestCase):
             self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", scan_output,
                                           ai_client=f.ai), 0)
         self.assertEqual(len(f.ai.calls), 1)
+        output = io.StringIO()
         with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
              patch("kernel_tools.pipeline.run_remote") as remote, \
-             contextlib.redirect_stdout(io.StringIO()):
+             contextlib.redirect_stdout(output):
             self.assertEqual(generate_from_scan(scan_output, f.repo, "test", f.config,
                                                 generation_output, ai_client=f.ai), 0)
             remote.assert_not_called()
+        self.assertIn("[generate 1/3] Verify scan result", output.getvalue())
+        self.assertIn("[generate 2/3] Read and verify actual sources", output.getvalue())
+        self.assertIn("[generate 3/3] Generate cases", output.getvalue())
+        self.assertNotIn("[pipeline", output.getvalue())
         self.assertEqual(len(f.ai.calls), 2)
         self.assertEqual(f.ai.calls[1][1], CASE_SCHEMA)
         state = json.loads((generation_output / "workflow.json").read_text())
         self.assertEqual(state["status"], "prepared")
+        self.assertEqual(state["operation"], "generate")
         self.assertEqual(Path(state["scan_source"]), (scan_output / "review.json").resolve())
         self.assertEqual(len(list((generation_output / "cases").glob("*.json"))), 1)
 

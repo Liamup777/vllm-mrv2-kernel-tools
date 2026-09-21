@@ -102,11 +102,12 @@ def render_pipeline(root, state, execution_report=""):
     save_json(root / "workflow.json", state)
 
 
-def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/gpu",
-             codex=None, model=None, reasoning_effort=None, ai_timeout=1800, device=None,
-             warmup=10, rounds=100, timeout=600, prepare_only=False,
-             dry_run=False, ai_client=None, cases_output=None, resume=False,
-             scan_input=None):
+def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/gpu",
+                      codex=None, model=None, reasoning_effort=None, ai_timeout=1800,
+                      device=None, warmup=10, rounds=100, timeout=600,
+                      prepare_only=False, dry_run=False, ai_client=None,
+                      cases_output=None, resume=False, scan_input=None,
+                      operation="pipeline"):
     target_config = load_target(config, npu)
     configured_codex = resolve_codex(config, codex)
     device = device or target_config.get("device", "npu:0")
@@ -154,8 +155,9 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
         raise ValueError(f"Case output already exists: {cases_dir}; use a new or empty directory")
     root.mkdir(parents=True, exist_ok=True)
     state = prior or {"schema_version": 2, "base": base, "target": target, "npu": npu,
-                      "status": "running", "stage": "scan", "generation": {},
+                      "status": "running", "stage": operation, "operation": operation, "generation": {},
                       "cases_path": str(cases_dir), "scope": scope, "stage_history": []}
+    state["operation"] = operation
     if resume:
         state["status"] = "running"
         state.pop("error", None)
@@ -167,7 +169,7 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
         state["stage"] = name
         state.setdefault("stage_history", []).append({"stage": name,
             "time": datetime.now(timezone.utc).isoformat()})
-        prefix = f"[pipeline {progress}]" if progress else "[pipeline]"
+        prefix = f"[{operation} {progress}]" if progress else f"[{operation}]"
         print(f"{prefix} {name}", flush=True)
         persist()
     persist()
@@ -180,14 +182,16 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
             "reasoning_effort_source": "injected/configured",
             "timeout_seconds": ai_timeout})
         state["model"] = state["ai"]["model"]
-        print(f"[pipeline] output={root}", flush=True)
-        print(f"[pipeline] AI model={state['ai']['model']} ({state['ai']['model_source']}), "
+        print(f"[{operation}] output={root}", flush=True)
+        print(f"[{operation}] AI model={state['ai']['model']} ({state['ai']['model_source']}), "
               f"reasoning={state['ai']['reasoning_effort']} "
               f"({state['ai'].get('reasoning_effort_source', 'Codex config')}), "
               f"executable={state['ai']['executable']}", flush=True)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-pipeline-") as tmp:
             workspace = Path(tmp)
-            stage("Static scan and exact tag source extraction", "1/6")
+            stage("Verify scan result against exact tag sources" if operation == "generate"
+                  else "Static scan and exact tag source extraction",
+                  "1/3" if operation == "generate" else "1/6")
             delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
             state["delta"] = delta
             before = json.loads((workspace / "scan/base.json").read_text())
@@ -213,7 +217,8 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                 state["review"] = review
                 state["review_policy_version"] = REVIEW_POLICY_VERSION
                 state["scan_source"] = str(scan_file)
-                stage("Reuse independent scan result", "2/6")
+                if operation != "generate":
+                    stage("Reuse independent scan result", "2/6")
             elif (resume and state.get("review") and
                     state.get("review_policy_version") == REVIEW_POLICY_VERSION):
                 review = state["review"]
@@ -246,7 +251,8 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                 state["status"] = "needs_review" if incomplete else "no_new_operators"
                 persist()
                 return 1 if incomplete else 0
-            stage(f"Read and verify actual sources on {npu}", "3/6")
+            stage(f"Read and verify actual sources on {npu}",
+                  "2/3" if operation == "generate" else "3/6")
             snapshot = fetch_snapshot(target_config, workspace / "runtime", device=device,
                                       failure_log=root / "logs/snapshot.log")
             state["runtime"] = snapshot
@@ -292,9 +298,11 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
                               "cases_json": json.dumps(generated)}
                     validate_bundle(bundle, operator, runtime_sources)
                     cases.extend(generated)
-                    stage(f"Reuse cases {index}/{len(operators)}: {operator['kernel']}", "4/6")
+                    stage(f"Reuse cases {index}/{len(operators)}: {operator['kernel']}",
+                          "3/3" if operation == "generate" else "4/6")
                     continue
-                stage(f"Generate cases {index}/{len(operators)}: {operator['kernel']}", "4/6")
+                stage(f"Generate cases {index}/{len(operators)}: {operator['kernel']}",
+                      "3/3" if operation == "generate" else "4/6")
                 task = ("Generate multi-scenario cases for this operator:\n" + json.dumps(operator, ensure_ascii=False)
                     + "\nRead target/ for intended upstream behavior and runtime/ for ACTUAL imported NPU sources. "
                     "runtime/snapshot.json records versions. Resolve Ascend patches and imports from runtime; "
@@ -398,15 +406,22 @@ def pipeline(repo, base, target, npu, config, output, *, scope="vllm/v1/worker/g
         (root / "logs").mkdir(exist_ok=True)
         (root / "logs/pipeline.log").write_text(traceback.format_exc())
         persist()
-        print(f"Pipeline stopped: {error}", file=sys.stderr)
+        print(f"{operation.capitalize()} stopped: {error}", file=sys.stderr)
         return 130 if isinstance(error, KeyboardInterrupt) else 1
     finally:
         print(f"Report: {root / 'report.md'}", flush=True)
 
 
+def pipeline(repo, base, target, npu, config, output, **kwargs):
+    """Run scan, case generation and NPU execution as one workflow."""
+    return _execute_workflow(repo, base, target, npu, config, output,
+                             operation="pipeline", **kwargs)
+
+
 def generate_from_scan(scan_input, repo, npu, config, output, **kwargs):
     """Generate reusable direct-Triton cases from a completed scan artifact."""
     _, document = load_scan_result(scan_input)
-    return pipeline(repo, document["base"]["tag"], document["target"]["tag"],
-                    npu, config, output, scope=document["scope"],
-                    prepare_only=True, scan_input=scan_input, **kwargs)
+    return _execute_workflow(repo, document["base"]["tag"], document["target"]["tag"],
+                             npu, config, output, scope=document["scope"],
+                             prepare_only=True, scan_input=scan_input,
+                             operation="generate", **kwargs)
