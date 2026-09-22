@@ -68,7 +68,10 @@ python -m kernel_tools --help
 python -m kernel_tools cases list examples/fill_num_accepted.json
 python -m kernel_tools cases validate examples/fill_num_accepted.json
 python -m kernel_tools run examples/fill_num_accepted.json --dry-run
+python -m kernel_tools run examples/fill_num_accepted.json --case-name smoke
 ```
+
+`run --case-name <name>` 只运行指定场景；如果不同 kernel 使用了相同场景名，再加 `--kernel <name>`。执行时终端会实时显示环境检查、当前 case、worker stdout/stderr 和最终状态；失败输出同时完整保存在 `logs/` 并链接到报告。
 
 也可以安装命令行入口（不安装/升级 NPU 依赖）：
 

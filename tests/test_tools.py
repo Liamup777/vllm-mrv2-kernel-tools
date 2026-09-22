@@ -218,10 +218,13 @@ class RunnerTest(unittest.TestCase):
         self.temp.cleanup()
 
     def run_cases(self, cases, **kwargs):
-        with contextlib.redirect_stdout(io.StringIO()):
-            return run_suite(cases, cwd=self.root, output=self.output, rounds=2,
-                             timeout=.5, probe_info=self.info,
-                             worker_command=[sys.executable, str(self.worker)], **kwargs)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            status = run_suite(cases, cwd=self.root, output=self.output, rounds=2,
+                               timeout=.5, probe_info=self.info,
+                               worker_command=[sys.executable, str(self.worker)], **kwargs)
+        self.stdout = stdout.getvalue()
+        return status
 
     def rows(self):
         return [r for p in (self.output / "results").glob("*.json")
@@ -238,6 +241,9 @@ class RunnerTest(unittest.TestCase):
         self.assertEqual(len(list((self.output / "logs").rglob("*.log"))), 2)
         self.assertIn("full diagnostic line", (self.output / rows[0]["log"]).read_text())
         self.assertNotIn("latencies_ms", next((self.output / "results").glob("*.json")).read_text())
+        self.assertIn("CompilationError: UB overflow, full diagnostic line", self.stdout)
+        self.assertIn("kernel/fail: failed — compile", self.stdout)
+        self.assertIn("kernel/ok: success — mean=10.000 us", self.stdout)
 
     def test_reject_wrong_identity_and_missing_samples(self):
         self.run_cases([case("bad_identity"), case("bad_samples")])
@@ -252,6 +258,8 @@ class RunnerTest(unittest.TestCase):
         self.info = {"npu_available": False, "npu_error": "No torch_npu"}
         self.assertEqual(self.run_cases([case(), case("second")]), 1)
         self.assertEqual([r["status"] for r in self.rows()], ["blocked", "blocked"])
+        self.assertIn("[environment] blocked: No torch_npu", self.stdout)
+        self.assertIn("test_kernel/ok: blocked — No torch_npu", self.stdout)
 
     def test_source_changed_after_generation_blocks_worker(self):
         self.assertEqual(self.run_cases([case()], expected_identity="mismatched-fingerprint"), 1)

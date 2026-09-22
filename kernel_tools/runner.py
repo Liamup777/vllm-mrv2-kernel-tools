@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -109,9 +110,22 @@ def run_one(case, cwd, env, device, warmup, rounds, timeout, log_path, worker_co
         capture = Path(tmp) / "process.log"
         phase, reason = "unknown", "case process failed"
         interrupted = False
-        with capture.open("wb") as stream:
-            proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=stream,
-                                    stderr=subprocess.STDOUT, start_new_session=True)
+        worker_env = dict(env)
+        worker_env["PYTHONUNBUFFERED"] = "1"
+        with capture.open("w", encoding="utf-8", errors="replace") as stream:
+            proc = subprocess.Popen(command, cwd=cwd, env=worker_env, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, start_new_session=True,
+                                    text=True, encoding="utf-8", errors="replace", bufsize=1)
+
+            def forward_output():
+                for line in proc.stdout:
+                    stream.write(line)
+                    stream.flush()
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+
+            output_thread = threading.Thread(target=forward_output, daemon=True)
+            output_thread.start()
             try:
                 code = proc.wait(timeout=timeout)
                 reason = f"worker exited with code {code}"
@@ -121,6 +135,8 @@ def run_one(case, cwd, env, device, warmup, rounds, timeout, log_path, worker_co
                 reason = "run interrupted" if interrupted else f"case exceeded {timeout:g} seconds"
                 os.killpg(proc.pid, signal.SIGKILL)
                 code = proc.wait()
+            output_thread.join(timeout=5)
+            proc.stdout.close()
         data = None
         if output.exists():
             try:
@@ -200,10 +216,15 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
     if not cwd.is_dir():
         raise ValueError(f"Working directory not found: {cwd}")
     env = runtime_env(cwd, list(pythonpath))
+    print(f"[environment] probing {device} from {cwd}", flush=True)
     try:
         info = probe_info if probe_info is not None else probe(cwd, env, device)
     except (ValueError, OSError, subprocess.TimeoutExpired) as error:
         info = {"npu_available": False, "npu_error": str(error)}
+    if info.get("npu_available"):
+        print(f"[environment] {device} ready", flush=True)
+    else:
+        print(f"[environment] blocked: {info.get('npu_error', 'NPU unavailable')}", flush=True)
     if expected_identity:
         from .snapshot import source_identity
         actual = source_identity(info)["fingerprint"]
@@ -282,12 +303,15 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
                     row.update(status="blocked", failure={"phase": "environment" if not stopped else "interrupted",
                                "reason": info.get("npu_error", "NPU unavailable") if not stopped else "previous case interrupted",
                                "error": []})
+                    print(f"[{index}/{total}] {kernel}/{case['name']}: blocked — "
+                          f"{row['failure']['reason']}", flush=True)
                     persist()
                     continue
                 row["attempts"] += 1
                 row["status"] = "running"
                 persist()
-                print(f"[{index}/{total}] {kernel}/{case['name']}", flush=True)
+                print(f"[{index}/{total}] {kernel}/{case['name']}: running "
+                      f"target={case['target']} grid={case['grid']}", flush=True)
                 log = Path("logs") / file_key(kernel) / (file_key(case["name"]) + ".log")
                 result = run_one(case, cwd, env, device, warmup, rounds, timeout, output / log, worker_command)
                 for field in ("failure", "log", "latency_us", "binding"):
@@ -295,6 +319,13 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
                 row.update(result)
                 if result["status"] != "success":
                     row["log"] = str(log)
+                    failure = result["failure"]
+                    print(f"[{index}/{total}] {kernel}/{case['name']}: {result['status']} — "
+                          f"{failure['phase']}: {failure['reason']}", flush=True)
+                    print(f"[{index}/{total}] failed log: {output / log}", flush=True)
+                else:
+                    print(f"[{index}/{total}] {kernel}/{case['name']}: success — "
+                          f"mean={result['latency_us']['mean']:.3f} us", flush=True)
                 stopped = result["status"] == "interrupted"
                 persist()
     print(f"Report: {output / 'report.md'}", flush=True)
