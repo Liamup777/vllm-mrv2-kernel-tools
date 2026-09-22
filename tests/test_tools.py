@@ -83,7 +83,7 @@ class CasesTest(unittest.TestCase):
             target = resolve_target(str(file) + ":kernel")
             self.assertEqual(target[(2,)], (2,))
 
-    def test_remote_run_uses_fingerprint_stored_in_generated_case(self):
+    def test_remote_run_ignores_fingerprint_stored_in_generated_case(self):
         from kernel_tools.cli import main
         with tempfile.TemporaryDirectory() as tmp:
             input_file = Path(tmp) / "case.json"
@@ -93,22 +93,19 @@ class CasesTest(unittest.TestCase):
             with patch("kernel_tools.remote.load_target", return_value={"device": "npu:0"}), \
                  patch("kernel_tools.remote.run_remote", return_value=0) as remote:
                 self.assertEqual(main(["run", str(input_file), "--target", "test"]), 0)
-            self.assertEqual(remote.call_args.kwargs["expected_identity"], "abc123")
+            self.assertNotIn("expected_identity", remote.call_args.kwargs)
 
-    def test_remote_run_reads_generation_source_lock(self):
+    def test_remote_run_does_not_require_generation_source_lock(self):
         from kernel_tools.cli import main
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "generation"
-            lock = make_source_lock({"vllm": {"commit": "a" * 40, "dirty": False,
-                "files": {"vllm/kernel.py": "b" * 64}}})
             generated = case()
-            generated["source"] = {"source_lock": lock["fingerprint"]}
+            generated["source"] = {"source_lock": "generated-lock-fingerprint"}
             save_json(root / "cases/case.json", [generated])
-            save_json(root / "source-lock.json", lock)
             with patch("kernel_tools.remote.load_target", return_value={"device": "npu:0"}), \
                  patch("kernel_tools.remote.run_remote", return_value=0) as remote:
                 self.assertEqual(main(["run", str(root), "--npu", "test"]), 0)
-            self.assertEqual(remote.call_args.kwargs["source_lock"]["fingerprint"], lock["fingerprint"])
+            self.assertNotIn("source_lock", remote.call_args.kwargs)
 
     def test_verify_routes_source_lock_to_npu(self):
         from kernel_tools.cli import main

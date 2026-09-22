@@ -221,10 +221,6 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             argv.append("--resume")
         for path in target.get("pythonpath", []):
             argv += ["--pythonpath", path]
-        if expected_identity:
-            argv += ["--expected-source-fingerprint", expected_identity]
-        if source_lock:
-            argv += ["--source-lock", stage + "/source-lock.json"]
     command = target_command(target, argv, tool_root=stage)
     if dry_run:
         print(json.dumps({"host": target["host"], "container": target.get("container"),
@@ -248,16 +244,10 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             bundle = Path(tmp) / "bundle.tar"
             payload = Path(tmp) / "input.json"
             save_json(payload, cases)
-            lock_file = Path(tmp) / "source-lock.json"
-            if source_lock:
-                validate_source_lock(source_lock)
-                save_json(lock_file, source_lock)
             with tarfile.open(bundle, "w") as tar:
                 for source in sorted(Path(__file__).parent.glob("*.py")):
                     tar.add(source, arcname="kernel_tools/" + source.name)
                 tar.add(payload, arcname="input.json")
-                if source_lock:
-                    tar.add(lock_file, arcname="source-lock.json")
             checked_ssh(target, shlex.join(["mkdir", "-p", stage]))
             staged = True
             with bundle.open("rb") as file:

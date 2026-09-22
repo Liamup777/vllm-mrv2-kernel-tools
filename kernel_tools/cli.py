@@ -184,25 +184,6 @@ def main(argv=None):
             from .runner import new_run_path, run_suite
             case_path = _case_path(args.path)
             cases = select_cases(load_cases(case_path), args.kernel, args.case_name)
-            source_lock = _load_source_lock(args.source_lock or args.path)
-            locked = {case.get("source", {}).get("source_lock") for case in cases
-                      if case.get("source", {}).get("source_lock")}
-            if len(locked) > 1:
-                raise ValueError("Selected cases were generated from different local source locks")
-            expected_lock = next(iter(locked), None)
-            if expected_lock and not source_lock:
-                raise ValueError("Generated cases require source-lock.json; run from their generation/cases directory")
-            if source_lock and expected_lock and source_lock["fingerprint"] != expected_lock:
-                raise ValueError("source-lock.json differs from the selected generated cases")
-            fingerprints = {case.get("source", {}).get("runtime_fingerprint") for case in cases
-                            if case.get("source", {}).get("runtime_fingerprint")}
-            if len(fingerprints) > 1:
-                raise ValueError("Selected cases were generated from different runtime source snapshots")
-            generated_fingerprint = next(iter(fingerprints), None)
-            if (args.expected_source_fingerprint and generated_fingerprint and
-                    args.expected_source_fingerprint != generated_fingerprint):
-                raise ValueError("Explicit source fingerprint differs from generated cases")
-            expected_fingerprint = args.expected_source_fingerprint or generated_fingerprint
             if args.resume and not args.output:
                 raise ValueError("--resume requires the original --output directory")
             output = args.output or new_run_path()
@@ -211,7 +192,6 @@ def main(argv=None):
                 target = load_target(args.config, args.npu)
                 return run_remote(target, cases, output, device=args.device or target.get("device", "npu:0"),
                                   warmup=args.warmup, rounds=args.rounds, timeout=args.timeout, dry_run=args.dry_run,
-                                  expected_identity=expected_fingerprint, source_lock=source_lock,
                                   resume=args.resume)
             if args.dry_run:
                 print(json.dumps({"cases": [f"{c['kernel']}/{c['name']}" for c in cases],
@@ -221,8 +201,7 @@ def main(argv=None):
             else:
                 return run_suite(cases, cwd=args.cwd, output=output, device=args.device or "npu:0",
                                  warmup=args.warmup, rounds=args.rounds, timeout=args.timeout,
-                                 pythonpath=[p.resolve() for p in args.pythonpath], resume=args.resume,
-                                 expected_identity=expected_fingerprint, source_lock=source_lock)
+                                 pythonpath=[p.resolve() for p in args.pythonpath], resume=args.resume)
         elif args.command == "verify":
             source_lock = _load_source_lock(args.path, required=True)
             if args.npu:

@@ -15,7 +15,7 @@ python3 -m kernel_tools run ~/kernel-results/generate-029 \
   --npu npu162 --output ~/kernel-results/run-029
 ```
 
-`scan` 和 `generate` 只读取本地源码。`generate` 不需要 NPU 配置，也不连接 SSH。`run` 读取生成目录中的 `source-lock.json`，先核对远端实际 import 的源码，再运行 case。三个输出目录互相独立，每一步都可使用原 `--output` 加 `--resume` 继续。
+`scan` 和 `generate` 只读取本地源码。`generate` 不需要 NPU 配置，也不连接 SSH。独立 `run` 只运行输入 case，不检查源码版本或工作区状态；需要检查时先显式执行 `verify`。`pipeline` 在自动远端执行前使用生成目录中的 `source-lock.json` 做版本门禁。三个输出目录互相独立，每一步都可使用原 `--output` 加 `--resume` 继续。
 
 一条命令可以执行同样的流程：
 
@@ -89,7 +89,7 @@ python3 -m kernel_tools verify ~/kernel-results/compact-sampling \
 
 Git 忽略的构建产物不参与比较，例如 vLLM-Ascend 构建生成的 `_build_info.py` 和 `_cann_ops_custom/`。未被忽略的未跟踪 Python 文件仍会进入 source lock，因此可以验证尚未提交的本地 kernel 修改。
 
-任一项不一致都会报出 package、期望 commit、实际 commit 和文件差异，并停止执行。没有绕过源码校验的选项。`run` 内部始终再次执行相同校验，单独运行 `verify` 只是为了提前检查环境。
+任一项不一致都会报出 package、期望 commit、实际 commit 和文件差异。`pipeline` 会因此停止自动执行；显式 `verify` 只报告检查结果。独立 `run` 不读取 source lock，适合用户已经确认环境后直接运行单个 case。
 
 工具不会 checkout、reset 或修改远端仓库。包 metadata 版本仅作为环境信息，源码身份以实际 import 路径、Git HEAD 和文件哈希为准。
 
@@ -125,6 +125,6 @@ scan、generate、run 和 pipeline 都支持 `--resume`。恢复时：
 - 远端已有活动进程时拒绝重复启动；
 - case、source lock、目标配置、工具代码或测量参数变化时拒绝复用旧结果。
 
-`--cases-output` 可把 case 放到独立目录。工具会同时放置对应的 `source-lock.json`，因此该目录可直接传给 `verify` 或 `run`。
+`--cases-output` 可把 case 放到独立目录。工具会同时放置对应的 `source-lock.json`，因此该目录可直接传给 `verify`；`run` 可以直接使用目录中的 case，也可以只使用其中一个 case 文件。
 
 临时源码上下文、扫描中间文件和 AI 成功事件流保存在系统临时目录，结束后清理，不写入工具仓库。
