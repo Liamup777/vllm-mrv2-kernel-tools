@@ -1,6 +1,7 @@
 """Scan → AI review/cases → deterministic remote run → evidence-based report."""
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import math
@@ -52,11 +53,75 @@ def validate_bundle(bundle, operator, runtime_sources):
     return cases
 
 
+def resolve_named_kernels(target_sources, selectors):
+    """Resolve explicit names to target-tag Triton JIT definitions."""
+    definitions = []
+    for path, source in target_sources.items():
+        try:
+            tree = ast.parse(source, filename=path)
+        except SyntaxError:
+            continue
+        module_name = path.removesuffix(".py").replace("/", ".").removesuffix(".__init__")
+
+        class Finder(ast.NodeVisitor):
+            def __init__(self):
+                self.scope = [module_name]
+
+            def visit_ClassDef(self, node):
+                self.scope.append(node.name)
+                self.generic_visit(node)
+                self.scope.pop()
+
+            def visit_FunctionDef(self, node):
+                def dotted(value):
+                    if isinstance(value, ast.Name):
+                        return value.id
+                    if isinstance(value, ast.Attribute):
+                        parent = dotted(value.value)
+                        return parent + "." + value.attr if parent else None
+                    return None
+                jit = any((dotted(item.func) if isinstance(item, ast.Call) else dotted(item) or "").endswith(".jit")
+                          for item in node.decorator_list)
+                if jit:
+                    definitions.append((".".join([*self.scope, node.name]), path, node))
+                self.scope.append(node.name)
+                self.generic_visit(node)
+                self.scope.pop()
+
+            visit_AsyncFunctionDef = visit_FunctionDef
+
+        Finder().visit(tree)
+    selected, seen = [], set()
+    for selector in selectors:
+        matches = [item for item in definitions
+                   if item[0] == selector or item[2].name == selector]
+        if not matches:
+            raise ValueError(f"Triton JIT kernel not found at target tag: {selector}")
+        if len(matches) > 1:
+            identities = ", ".join(sorted(item[0] for item in matches))
+            raise ValueError(f"Kernel name is ambiguous; use a full Python ID for {selector}: {identities}")
+        identity, path, definition = matches[0]
+        if identity in seen:
+            raise ValueError(f"Kernel selected more than once: {identity}")
+        seen.add(identity)
+        selected.append({
+            "id": identity,
+            "kernel": definition.name,
+            "definition": path,
+            "classification": "selected",
+            "reason": "用户显式指定该 Triton JIT kernel 生成单算子用例。",
+            "evidence": f"目标 tag 定义：{path}:{definition.lineno}",
+        })
+    return selected
+
+
 def render_pipeline(root, state, execution_report=""):
     def safe(value):
         return str(value).replace("|", "\\|").replace("\n", " ")
-    lines = ["# 新增 Triton 算子测试报告", "",
-             f"版本：`{state['base']}` → `{state['target']}`；NPU 目标：`{state['npu']}`。", "",
+    version = (f"目标版本：`{state['target']}`" if state.get("selection_mode") == "manual"
+               else f"版本：`{state['base']}` → `{state['target']}`")
+    lines = ["# Triton 单算子测试报告", "",
+             f"{version}；NPU 目标：`{state['npu']}`。", "",
              f"流程状态：**{state['status']}**；当前/最后阶段：`{state['stage']}`。", "",
              f"生成用例目录：`{state['cases_path']}`。", "",
              "静态扫描和 AI 复核仍可能遗漏动态路径；数值检查通过仅代表所列输入。", ""]
@@ -106,8 +171,9 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                       codex=None, model=None, reasoning_effort=None, ai_timeout=1800,
                       device=None, warmup=10, rounds=100, timeout=600,
                       prepare_only=False, dry_run=False, ai_client=None,
-                      cases_output=None, resume=False, scan_input=None,
+                      cases_output=None, resume=False, scan_input=None, selected_kernels=None,
                       operation="pipeline"):
+    selected_kernels = list(selected_kernels or [])
     target_config = load_target(config, npu)
     configured_codex = resolve_codex(config, codex)
     device = device or target_config.get("device", "npu:0")
@@ -123,6 +189,8 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
             raise ValueError(f"Cannot resume without {workflow}")
         prior = json.loads(workflow.read_text())
         expected_run = {"base": base, "target": target, "npu": npu}
+        if selected_kernels or "selected_kernels" in prior:
+            expected_run["selected_kernels"] = selected_kernels
         mismatched = [k for k, value in expected_run.items() if prior.get(k) != value]
         if mismatched:
             raise ValueError("Resume arguments differ from workflow.json: " + ", ".join(mismatched))
@@ -139,15 +207,22 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
         raise ValueError("--cases-output must be a separate case directory")
     if dry_run:
         ai_plan = describe_codex(configured_codex, model, ai_timeout, reasoning_effort)
-        print(json.dumps({"base": base, "target": target, "npu": npu, "device": device,
-            "steps": ["verify reusable scan result" if scan_input else "scan",
+        plan = {"target": target, "npu": npu, "device": device,
+            "steps": ["resolve explicitly selected kernels" if selected_kernels else
+                      "verify reusable scan result" if scan_input else "scan",
+                      "skip release review" if selected_kernels else
                       "reuse AI review" if scan_input or (resume and prior.get("review")) else "AI review with release skill", "read actual NPU sources",
                       "AI JSON cases with case skill", "validate",
                       "stop after generation" if prepare_only else "NPU run and failure analysis"],
             "AI": {**ai_plan, "command": [configured_codex, "exec"]},
             "output": str(root), "cases_output": str(cases_dir),
             "resume": resume,
-            "note": "No AI request, SSH connection or NPU job started"}, ensure_ascii=False, indent=2))
+            "note": "No AI request, SSH connection or NPU job started"}
+        if base is not None:
+            plan["base"] = base
+        if selected_kernels:
+            plan["kernels"] = selected_kernels
+        print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
     if not resume and root.exists() and any(root.iterdir()):
         raise ValueError(f"Pipeline output already exists: {root}; use a new output directory")
@@ -156,7 +231,9 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
     root.mkdir(parents=True, exist_ok=True)
     state = prior or {"schema_version": 2, "base": base, "target": target, "npu": npu,
                       "status": "running", "stage": operation, "operation": operation, "generation": {},
-                      "cases_path": str(cases_dir), "scope": scope, "stage_history": []}
+                      "cases_path": str(cases_dir), "scope": scope, "stage_history": [],
+                      "selected_kernels": selected_kernels,
+                      "selection_mode": "manual" if selected_kernels else "release_scan"}
     state["operation"] = operation
     if resume:
         state["status"] = "running"
@@ -189,49 +266,60 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
               f"executable={state['ai']['executable']}", flush=True)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-pipeline-") as tmp:
             workspace = Path(tmp)
-            stage("Verify scan result against exact tag sources" if operation == "generate"
-                  else "Static scan and exact tag source extraction",
-                  "1/3" if operation == "generate" else "1/6")
-            delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
-            state["delta"] = delta
-            before = json.loads((workspace / "scan/base.json").read_text())
-            after = json.loads((workspace / "scan/target.json").read_text())
-            write_sources(repo, base, workspace / "base")
-            commit, target_sources = write_sources(repo, target, workspace / "target")
-            if scan_input:
-                scan_file, scan_document = load_scan_result(scan_input)
-                expected_scan = {
-                    "base tag": (scan_document["base"]["tag"], base),
-                    "base commit": (scan_document["base"]["commit"], delta["base"]["commit"]),
-                    "target tag": (scan_document["target"]["tag"], target),
-                    "target commit": (scan_document["target"]["commit"], delta["target"]["commit"]),
-                    "scope": (scan_document.get("scope"), scope),
-                }
-                mismatch = [name for name, (actual_value, expected_value) in expected_scan.items()
-                            if actual_value != expected_value]
-                if mismatch:
-                    raise ValueError("Scan result differs from requested sources: " + ", ".join(mismatch))
-                review = scan_document["review"]
-                from .review import validate_review
-                validate_review(review, delta, target_sources, before)
+            if selected_kernels:
+                stage("Resolve explicitly selected kernels at exact target tag", "1/3")
+                commit, target_sources = write_sources(repo, target, workspace / "target")
+                operators = resolve_named_kernels(target_sources, selected_kernels)
+                review = {"operators": operators, "unresolved": [],
+                          "summary": f"用户显式选择 {len(operators)} 个 Triton JIT kernel；未执行版本差异扫描。"}
                 state["review"] = review
-                state["review_policy_version"] = REVIEW_POLICY_VERSION
-                state["scan_source"] = str(scan_file)
-                if operation != "generate":
-                    stage("Reuse independent scan result", "2/6")
-            elif (resume and state.get("review") and
-                    state.get("review_policy_version") == REVIEW_POLICY_VERSION):
-                review = state["review"]
-                from .review import validate_review
-                validate_review(review, delta, target_sources, before)
-                stage("Reuse completed AI release review", "2/6")
+                state["target_commit"] = commit
+                incomplete = False
             else:
-                stage("AI release review with vllm-triton-release-scan", "2/6")
-                review = review_sources(ai, delta, target_sources, before, workspace,
-                                        root / "logs/ai-review.log")
-                state["review"] = review
-                state["review_policy_version"] = REVIEW_POLICY_VERSION
-            operators = [r for r in review["operators"] if r["classification"] == "new"]
+                stage("Verify scan result against exact tag sources" if operation == "generate"
+                      else "Static scan and exact tag source extraction",
+                      "1/3" if operation == "generate" else "1/6")
+                delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
+                state["delta"] = delta
+                before = json.loads((workspace / "scan/base.json").read_text())
+                write_sources(repo, base, workspace / "base")
+                commit, target_sources = write_sources(repo, target, workspace / "target")
+                if scan_input:
+                    scan_file, scan_document = load_scan_result(scan_input)
+                    expected_scan = {
+                        "base tag": (scan_document["base"]["tag"], base),
+                        "base commit": (scan_document["base"]["commit"], delta["base"]["commit"]),
+                        "target tag": (scan_document["target"]["tag"], target),
+                        "target commit": (scan_document["target"]["commit"], delta["target"]["commit"]),
+                        "scope": (scan_document.get("scope"), scope),
+                    }
+                    mismatch = [name for name, (actual_value, expected_value) in expected_scan.items()
+                                if actual_value != expected_value]
+                    if mismatch:
+                        raise ValueError("Scan result differs from requested sources: " + ", ".join(mismatch))
+                    review = scan_document["review"]
+                    from .review import validate_review
+                    validate_review(review, delta, target_sources, before)
+                    state["review"] = review
+                    state["review_policy_version"] = REVIEW_POLICY_VERSION
+                    state["scan_source"] = str(scan_file)
+                    if operation != "generate":
+                        stage("Reuse independent scan result", "2/6")
+                elif (resume and state.get("review") and
+                        state.get("review_policy_version") == REVIEW_POLICY_VERSION):
+                    review = state["review"]
+                    from .review import validate_review
+                    validate_review(review, delta, target_sources, before)
+                    stage("Reuse completed AI release review", "2/6")
+                else:
+                    stage("AI release review with vllm-triton-release-scan", "2/6")
+                    review = review_sources(ai, delta, target_sources, before, workspace,
+                                            root / "logs/ai-review.log")
+                    state["review"] = review
+                    state["review_policy_version"] = REVIEW_POLICY_VERSION
+                operators = [r for r in review["operators"] if r["classification"] == "new"]
+                incomplete = bool(review["unresolved"] or any(
+                    r["classification"] == "needs_review" for r in review["operators"]))
             operator_ids = {r["id"] for r in operators}
             # Old pipeline revisions generated per-run adapter modules. They are
             # incompatible with the JSON-only case policy and must not leak into
@@ -246,7 +334,6 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 state["generation"].pop(identity)
             if (root / "adapters").is_dir() and not any((root / "adapters").iterdir()):
                 (root / "adapters").rmdir()
-            incomplete = bool(review["unresolved"] or any(r["classification"] == "needs_review" for r in review["operators"]))
             if not operators:
                 state["status"] = "needs_review" if incomplete else "no_new_operators"
                 persist()
@@ -424,4 +511,14 @@ def generate_from_scan(scan_input, repo, npu, config, output, **kwargs):
     return _execute_workflow(repo, document["base"]["tag"], document["target"]["tag"],
                              npu, config, output, scope=document["scope"],
                              prepare_only=True, scan_input=scan_input,
+                             operation="generate", **kwargs)
+
+
+def generate_from_kernels(kernels, repo, target, npu, config, output, *,
+                          scope="vllm/v1/worker/gpu", **kwargs):
+    """Generate cases for explicitly selected target-tag Triton kernels."""
+    if not kernels or not all(isinstance(name, str) and name.strip() for name in kernels):
+        raise ValueError("At least one nonempty --kernel is required")
+    return _execute_workflow(repo, None, target, npu, config, output, scope=scope,
+                             prepare_only=True, selected_kernels=kernels,
                              operation="generate", **kwargs)

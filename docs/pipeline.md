@@ -15,6 +15,18 @@ python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
 
 `scan` 只读本地精确 tag 并完成 AI release review。`generate` 消费其输出目录或其中的 `review.json`，不会再次调用 release review；它会重新验证 tag、commit、扫描范围和 AST 候选，读取远端真实源码，然后逐算子生成 case。`run` 消费 case，自动使用其中保存的远端源码指纹，防止生成后环境变化。三个输出目录互相独立，任一步失败都可使用该步骤自己的 `--resume` 方式继续。`scan` 的未完成 AI 调用会重新发起；远端 `run` 会先确认原进程没有继续运行，再复用首次运行记录的远端结果目录。
 
+已知算子名称时可跳过 scan，直接生成：
+
+```bash
+python3 -m kernel_tools generate \
+  --kernel _fill_num_accepted_kernel \
+  --kernel vllm.v1.worker.gpu.sample.output._pack_sampling_mask_kernel \
+  --repo ../vllm --target v0.29.0 --npu npu162 \
+  --output ~/kernel-results/manual-cases-029
+```
+
+短名称必须在目标 tag 中唯一，否则需传完整 Python ID。固定代码确认每个选择项是目标 tag 中的 Triton JIT 定义；随后执行远端源码一致性检查和逐算子 case-generation AI，不调用 release-scan AI。
+
 也可以用一条命令完成相同流程：
 
 ```bash

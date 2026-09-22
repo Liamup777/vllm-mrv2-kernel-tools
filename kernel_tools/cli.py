@@ -70,9 +70,13 @@ def parser():
                       help="单次覆盖 Codex model_reasoning_effort，例如 low/medium/high/xhigh")
     scan.add_argument("--ai-timeout", type=float, default=1800)
     scan.add_argument("--resume", action="store_true", help="从原 --output 重新继续未完成的 AI 复核")
-    generate = sub.add_parser("generate", help="读取 scan 结果，调用 AI 生成可独立运行的单算子 case")
-    generate.add_argument("--scan", type=Path, required=True, help="scan 输出目录或 review.json")
-    generate.add_argument("--repo", type=Path, required=True, help="包含 scan 对应 tag 的本地 vLLM 仓库")
+    generate = sub.add_parser("generate", help="从 scan 结果或手动指定 kernel 生成单算子 case")
+    generate_source = generate.add_mutually_exclusive_group(required=True)
+    generate_source.add_argument("--scan", type=Path, help="scan 输出目录或 review.json")
+    generate_source.add_argument("--kernel", action="append", help="直接指定 kernel 名称或完整 Python ID；可重复")
+    generate.add_argument("--repo", type=Path, required=True, help="包含目标 tag 的本地 vLLM 仓库")
+    generate.add_argument("--target", help="--kernel 模式要求的目标 vLLM tag")
+    generate.add_argument("--scope", default="vllm/v1/worker/gpu", help="记录手动生成任务的 GPU 范围")
     generate.add_argument("--npu", required=True, help="读取实际源码的远端目标")
     generate.add_argument("--config", type=Path, default=Path("kernel-tools.json"))
     generate.add_argument("--output", type=Path)
@@ -180,17 +184,25 @@ def main(argv=None):
                                 reasoning_effort=args.reasoning_effort, ai_timeout=args.ai_timeout,
                                 resume=args.resume)
         elif args.command == "generate":
-            from .pipeline import generate_from_scan
+            from .pipeline import generate_from_kernels, generate_from_scan
             from .runner import new_run_path
             if args.resume and not args.output:
                 raise ValueError("generate --resume requires the original --output directory")
-            return generate_from_scan(args.scan, args.repo, args.npu, args.config,
-                                      args.output or new_run_path("generations"),
-                                      codex=args.codex, model=args.model,
-                                      reasoning_effort=args.reasoning_effort,
-                                      ai_timeout=args.ai_timeout, device=args.device,
-                                      cases_output=args.cases_output, resume=args.resume,
-                                      dry_run=args.dry_run)
+            common = dict(codex=args.codex, model=args.model,
+                          reasoning_effort=args.reasoning_effort,
+                          ai_timeout=args.ai_timeout, device=args.device,
+                          cases_output=args.cases_output, resume=args.resume,
+                          dry_run=args.dry_run)
+            output = args.output or new_run_path("generations")
+            if args.scan:
+                if args.target:
+                    raise ValueError("--target is derived from --scan; do not specify both")
+                return generate_from_scan(args.scan, args.repo, args.npu, args.config,
+                                          output, **common)
+            if not args.target:
+                raise ValueError("generate --kernel requires --target")
+            return generate_from_kernels(args.kernel, args.repo, args.target, args.npu,
+                                         args.config, output, scope=args.scope, **common)
         elif args.command == "pipeline":
             from .pipeline import pipeline
             from .runner import new_run_path

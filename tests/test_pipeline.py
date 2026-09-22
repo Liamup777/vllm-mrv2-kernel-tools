@@ -412,11 +412,51 @@ class ReviewCommandTest(unittest.TestCase):
         self.assertEqual(Path(state["scan_source"]), (scan_output / "review.json").resolve())
         self.assertEqual(len(list((generation_output / "cases").glob("*.json"))), 1)
 
+    def test_generate_explicit_kernel_skips_release_scan(self):
+        from kernel_tools.pipeline import generate_from_kernels
+        f = self.fixture
+        generation_output = f.root / "manual-generation"
+        output = io.StringIO()
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
+             patch("kernel_tools.pipeline.run_remote") as remote, \
+             contextlib.redirect_stdout(output):
+            self.assertEqual(generate_from_kernels(["added"], f.repo, "v1.1.0", "test",
+                                                   f.config, generation_output,
+                                                   ai_client=f.ai), 0)
+            remote.assert_not_called()
+        self.assertEqual(len(f.ai.calls), 1)
+        self.assertEqual(f.ai.calls[0][1], CASE_SCHEMA)
+        self.assertIn("[generate 1/3] Resolve explicitly selected kernels", output.getvalue())
+        self.assertNotIn("release review", output.getvalue())
+        state = json.loads((generation_output / "workflow.json").read_text())
+        self.assertEqual(state["selection_mode"], "manual")
+        self.assertEqual(state["selected_kernels"], ["added"])
+        self.assertEqual(state["review"]["operators"][0]["id"], IDENTITY)
+
+    def test_explicit_kernel_requires_unique_target_tag_jit(self):
+        from kernel_tools.pipeline import generate_from_kernels
+        f = self.fixture
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(generate_from_kernels(["missing"], f.repo, "v1.1.0", "test",
+                                                   f.config, f.root / "missing",
+                                                   ai_client=f.ai), 1)
+        state = json.loads((f.root / "missing/workflow.json").read_text())
+        self.assertIn("Triton JIT kernel not found", state["error"])
+        self.assertEqual(len(f.ai.calls), 0)
+
     def test_cli_generate_routes_completed_scan(self):
         from kernel_tools.cli import main
         with patch("kernel_tools.pipeline.generate_from_scan", return_value=0) as generate:
             self.assertEqual(main(["generate", "--scan", "scan-output", "--repo", ".",
                                    "--npu", "test", "--output", "generation-output"]), 0)
+            generate.assert_called_once()
+
+    def test_cli_generate_routes_explicit_kernel(self):
+        from kernel_tools.cli import main
+        with patch("kernel_tools.pipeline.generate_from_kernels", return_value=0) as generate:
+            self.assertEqual(main(["generate", "--kernel", "added", "--target", "v1.1.0",
+                                   "--repo", ".", "--npu", "test",
+                                   "--output", "generation-output"]), 0)
             generate.assert_called_once()
 
 

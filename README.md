@@ -37,6 +37,18 @@ python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
 
 `generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它仍会用固定代码核对 tag、commit、范围和候选，并读取远端实际源码。`run` 会自动读取生成 case 中的远端源码指纹，环境发生变化时拒绝执行。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 
+如果已经知道要测试的 kernel，可以完全跳过版本扫描：
+
+```bash
+python3 -m kernel_tools generate \
+  --kernel _fill_num_accepted_kernel \
+  --repo ../vllm --target v0.29.0 \
+  --npu npu162 --output ~/kernel-results/fill-num-accepted \
+  --model gpt-5.6-sol --reason medium
+```
+
+`--kernel` 可重复指定多个算子。工具通过目标 tag 的 AST 定位真实 `@triton.jit` 定义；短名称有重名时要求使用完整 Python ID，例如 `vllm.v1.worker.gpu.sample.output._fill_num_accepted_kernel`。此模式不调用 release-scan AI，但仍要求远端实际导入的 vLLM 源码与 `--target` 完全一致。
+
 ## 最快开始
 
 在这个仓库根目录运行，无需安装依赖：
