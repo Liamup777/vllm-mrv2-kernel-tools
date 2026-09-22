@@ -42,12 +42,11 @@ python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
 ```bash
 python3 -m kernel_tools generate \
   --kernel _fill_num_accepted_kernel \
-  --repo ../vllm --target v0.29.0 \
   --npu npu162 --output ~/kernel-results/fill-num-accepted \
   --model gpt-5.6-sol --reason medium
 ```
 
-`--kernel` 可重复指定多个算子。工具通过目标 tag 的 AST 定位真实 `@triton.jit` 定义；短名称有重名时要求使用完整 Python ID，例如 `vllm.v1.worker.gpu.sample.output._fill_num_accepted_kernel`。此模式不调用 release-scan AI，但仍要求远端实际导入的 vLLM 源码与 `--target` 完全一致。
+`--kernel` 可重复指定多个算子。工具下载 `--npu` 环境实际导入的 `vllm` 和 `vllm_ascend` Python 源码，并通过 AST 定位真实 `@triton.jit` 定义；短名称有重名时要求使用完整 Python ID，例如 `vllm_ascend.ops.example.example_kernel`。此模式不需要本地 `--repo` 或 `--target`，也不调用 release-scan AI。case 会记录远端源码指纹、所属包和实际 Git revision。
 
 ## 最快开始
 

@@ -20,12 +20,12 @@ python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
 ```bash
 python3 -m kernel_tools generate \
   --kernel _fill_num_accepted_kernel \
-  --kernel vllm.v1.worker.gpu.sample.output._pack_sampling_mask_kernel \
-  --repo ../vllm --target v0.29.0 --npu npu162 \
+  --kernel vllm_ascend.ops.example.example_kernel \
+  --npu npu162 \
   --output ~/kernel-results/manual-cases-029
 ```
 
-短名称必须在目标 tag 中唯一，否则需传完整 Python ID。固定代码确认每个选择项是目标 tag 中的 Triton JIT 定义；随后执行远端源码一致性检查和逐算子 case-generation AI，不调用 release-scan AI。
+短名称必须在远端实际导入的 `vllm` 和 `vllm_ascend` 源码中唯一，否则需传完整 Python ID。此模式不读取本地 tag，也不要求 `--repo` 或 `--target`；固定代码确认每个选择项是远端源码中的 Triton JIT 定义，随后执行逐算子 case-generation AI，不调用 release-scan AI。
 
 也可以用一条命令完成相同流程：
 

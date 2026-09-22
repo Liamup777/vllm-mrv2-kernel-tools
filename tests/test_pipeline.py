@@ -420,13 +420,14 @@ class ReviewCommandTest(unittest.TestCase):
         with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
              patch("kernel_tools.pipeline.run_remote") as remote, \
              contextlib.redirect_stdout(output):
-            self.assertEqual(generate_from_kernels(["added"], f.repo, "v1.1.0", "test",
-                                                   f.config, generation_output,
+            self.assertEqual(generate_from_kernels(["added"], "test", f.config,
+                                                   generation_output,
                                                    ai_client=f.ai), 0)
             remote.assert_not_called()
         self.assertEqual(len(f.ai.calls), 1)
         self.assertEqual(f.ai.calls[0][1], CASE_SCHEMA)
-        self.assertIn("[generate 1/3] Resolve explicitly selected kernels", output.getvalue())
+        self.assertIn("[generate 1/3] Read actual sources", output.getvalue())
+        self.assertIn("[generate 2/3] Resolve explicitly selected kernels", output.getvalue())
         self.assertNotIn("release review", output.getvalue())
         state = json.loads((generation_output / "workflow.json").read_text())
         self.assertEqual(state["selection_mode"], "manual")
@@ -436,13 +437,20 @@ class ReviewCommandTest(unittest.TestCase):
     def test_explicit_kernel_requires_unique_target_tag_jit(self):
         from kernel_tools.pipeline import generate_from_kernels
         f = self.fixture
-        with contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(generate_from_kernels(["missing"], f.repo, "v1.1.0", "test",
-                                                   f.config, f.root / "missing",
-                                                   ai_client=f.ai), 1)
+        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
+             contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(generate_from_kernels(["missing"], "test", f.config,
+                                                   f.root / "missing", ai_client=f.ai), 1)
         state = json.loads((f.root / "missing/workflow.json").read_text())
-        self.assertIn("Triton JIT kernel not found", state["error"])
+        self.assertIn("Triton JIT kernel not found in remote imported sources", state["error"])
         self.assertEqual(len(f.ai.calls), 0)
+
+    def test_explicit_kernel_resolves_vllm_ascend_runtime_source(self):
+        from kernel_tools.pipeline import resolve_named_kernels
+        rows = resolve_named_kernels({"vllm_ascend/ops/custom.py":
+            "import triton\n@triton.jit\ndef ascend_kernel(x): return x\n"}, ["ascend_kernel"])
+        self.assertEqual(rows[0]["id"], "vllm_ascend.ops.custom.ascend_kernel")
+        self.assertEqual(rows[0]["definition"], "vllm_ascend/ops/custom.py")
 
     def test_cli_generate_routes_completed_scan(self):
         from kernel_tools.cli import main
@@ -454,8 +462,7 @@ class ReviewCommandTest(unittest.TestCase):
     def test_cli_generate_routes_explicit_kernel(self):
         from kernel_tools.cli import main
         with patch("kernel_tools.pipeline.generate_from_kernels", return_value=0) as generate:
-            self.assertEqual(main(["generate", "--kernel", "added", "--target", "v1.1.0",
-                                   "--repo", ".", "--npu", "test",
+            self.assertEqual(main(["generate", "--kernel", "added", "--npu", "test",
                                    "--output", "generation-output"]), 0)
             generate.assert_called_once()
 

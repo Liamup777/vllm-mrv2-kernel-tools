@@ -74,9 +74,7 @@ def parser():
     generate_source = generate.add_mutually_exclusive_group(required=True)
     generate_source.add_argument("--scan", type=Path, help="scan 输出目录或 review.json")
     generate_source.add_argument("--kernel", action="append", help="直接指定 kernel 名称或完整 Python ID；可重复")
-    generate.add_argument("--repo", type=Path, required=True, help="包含目标 tag 的本地 vLLM 仓库")
-    generate.add_argument("--target", help="--kernel 模式要求的目标 vLLM tag")
-    generate.add_argument("--scope", default="vllm/v1/worker/gpu", help="记录手动生成任务的 GPU 范围")
+    generate.add_argument("--repo", type=Path, help="--scan 模式要求的本地 vLLM 仓库")
     generate.add_argument("--npu", required=True, help="读取实际源码的远端目标")
     generate.add_argument("--config", type=Path, default=Path("kernel-tools.json"))
     generate.add_argument("--output", type=Path)
@@ -195,14 +193,14 @@ def main(argv=None):
                           dry_run=args.dry_run)
             output = args.output or new_run_path("generations")
             if args.scan:
-                if args.target:
-                    raise ValueError("--target is derived from --scan; do not specify both")
+                if not args.repo:
+                    raise ValueError("generate --scan requires --repo")
                 return generate_from_scan(args.scan, args.repo, args.npu, args.config,
                                           output, **common)
-            if not args.target:
-                raise ValueError("generate --kernel requires --target")
-            return generate_from_kernels(args.kernel, args.repo, args.target, args.npu,
-                                         args.config, output, scope=args.scope, **common)
+            if args.repo:
+                raise ValueError("generate --kernel reads remote sources; do not specify --repo")
+            return generate_from_kernels(args.kernel, args.npu, args.config,
+                                         output, **common)
         elif args.command == "pipeline":
             from .pipeline import pipeline
             from .runner import new_run_path
