@@ -191,7 +191,7 @@ def render_report(root):
 
 def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, timeout=600,
               pythonpath=(), resume=False, probe_info=None, worker_command=None,
-              expected_identity=None):
+              expected_identity=None, source_lock=None):
     if warmup < 0 or rounds < 1 or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("Require warmup >= 0, rounds > 0 and a finite positive timeout")
     if not device.startswith("npu:") or not device[4:].isdigit():
@@ -211,6 +211,13 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
         if actual != expected_identity:
             info = {**info, "npu_available": False,
                     "npu_error": "Source/environment changed since AI case generation; start a new pipeline"}
+    if source_lock:
+        from .source_lock import verify_source_lock
+        try:
+            verified = verify_source_lock(source_lock, info)
+            info["source_lock"] = verified
+        except ValueError as error:
+            info = {**info, "npu_available": False, "npu_error": str(error)}
     sources = [source_snapshot(p) for p in dict.fromkeys([str(cwd), *map(str, pythonpath)])]
     imported_sources = {}
     for name in ("vllm", "vllm_ascend"):
@@ -227,7 +234,7 @@ def run_suite(cases, *, cwd, output, device="npu:0", warmup=10, rounds=100, time
                "isolation": "cooperative_lock_only"}
     tool_hash = digest({p.name: p.read_text() for p in Path(__file__).parent.glob("*.py")})
     signature = digest({"cases": cases, "context": context, "tool_hash": tool_hash})
-    if (resume and not expected_identity and
+    if (resume and not expected_identity and not source_lock and
             any(s["dirty"] is not False for s in [*sources, *imported_sources.values()])):
         raise ValueError("Resume of dirty/unversioned sources requires a generated case source fingerprint")
     if output.exists() and any(output.iterdir()) and not resume:

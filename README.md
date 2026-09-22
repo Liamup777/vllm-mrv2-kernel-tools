@@ -13,6 +13,7 @@
 
 ```bash
 python3 -m kernel_tools pipeline --repo ../vllm \
+  --source ../vllm-ascend \
   --base v0.28.0 --target v0.29.0 --npu npu165
 ```
 
@@ -29,24 +30,34 @@ python3 -m kernel_tools scan --repo ../vllm \
   --base v0.28.0 --target v0.29.0 --output ~/kernel-results/scan-029
 
 python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
-  --repo ../vllm --npu npu162 --output ~/kernel-results/generate-029
+  --repo ../vllm --source ../vllm-ascend \
+  --output ~/kernel-results/generate-029
 
-python3 -m kernel_tools run ~/kernel-results/generate-029/cases \
-  --target npu162 --output ~/kernel-results/run-029
+python3 -m kernel_tools run ~/kernel-results/generate-029 \
+  --npu npu162 --output ~/kernel-results/run-029
 ```
 
-`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它仍会用固定代码核对 tag、commit、范围和候选，并读取远端实际源码。`run` 会自动读取生成 case 中的远端源码指纹，环境发生变化时拒绝执行。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
+`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 记录 Git commit 和完整 Python 源码哈希。`run` 在启动 case 前核对远端实际 import 路径、commit 和源码哈希，任一不一致都会停止。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 
 如果已经知道要测试的 kernel，可以完全跳过版本扫描：
 
 ```bash
 python3 -m kernel_tools generate \
   --kernel _fill_num_accepted_kernel \
-  --npu npu162 --output ~/kernel-results/fill-num-accepted \
+  --source ../vllm/vllm/v1/worker/gpu/model_states/mamba_hybrid.py \
+  --output ~/kernel-results/fill-num-accepted \
   --model gpt-5.6-sol --reason medium
 ```
 
-`--kernel` 可重复指定多个算子。工具下载 `--npu` 环境实际导入的 `vllm` 和 `vllm_ascend` Python 源码，并通过 AST 定位真实 `@triton.jit` 定义；短名称有重名时要求使用完整 Python ID，例如 `vllm_ascend.ops.example.example_kernel`。此模式不需要本地 `--repo` 或 `--target`，也不调用 release-scan AI。case 会记录远端源码指纹、所属包和实际 Git revision。
+`--kernel` 可重复指定多个算子，`--source` 可指向本地文件或目录。工具只在指定范围定位 `@triton.jit` 定义，并补充包含该 kernel 名称的 Python 调用文件，不枚举两个仓库的全部 Triton 定义。短名称有重名时要求使用完整 Python ID，例如 `vllm_ascend.ops.example.example_kernel`。`--ref COMMIT` 可从指定 Git revision 读取源码；省略时读取当前 worktree。此模式不需要 `--repo`、`--target` 或 NPU，也不调用 release-scan AI。
+
+需要单独确认远端版本时运行：
+
+```bash
+python3 -m kernel_tools verify ~/kernel-results/fill-num-accepted --npu npu162
+```
+
+`run` 内部始终重复同样的校验，因此不能通过跳过 `verify` 绕过源码约束。
 
 ## 最快开始
 
@@ -76,7 +87,7 @@ kernel-tools --help
 python -m kernel_tools init
 ```
 
-这会在当前目录创建 `kernel-tools.json`。文件已存在时不会覆盖，直接编辑即可。每个 `targets` 成员是一套 NPU 环境，名称由 `--target` 或 `--npu` 引用。例如 Docker 环境：
+这会在当前目录创建 `kernel-tools.json`。文件已存在时不会覆盖，直接编辑即可。每个 `targets` 成员是一套 NPU 环境，名称由 `--npu` 引用。例如 Docker 环境：
 
 ```json
 {
@@ -177,7 +188,7 @@ Host npu162
 配置后先检查连接、环境和实际 import 路径：
 
 ```bash
-python -m kernel_tools doctor --config kernel-tools.json --target npu162
+python -m kernel_tools doctor --config kernel-tools.json --npu npu162
 ```
 
 `doctor` 会显示 Python、Torch、torch_npu、Triton、CANN、NPU 状态，以及 vLLM/vLLM-Ascend 的实际 import 位置。若这里显示的源码路径与 `pythonpath` 预期不一致，应先修正配置，不要直接运行 pipeline。
@@ -185,18 +196,18 @@ python -m kernel_tools doctor --config kernel-tools.json --target npu162
 只检查将要使用的 SSH/Docker 命令而不连接远端：
 
 ```bash
-python -m kernel_tools doctor --config kernel-tools.json --target npu162 --dry-run
+python -m kernel_tools doctor --config kernel-tools.json --npu npu162 --dry-run
 ```
 
 确认环境后运行单算子 case：
 
 ```bash
 python -m kernel_tools run examples/fill_num_accepted.json \
-  --config kernel-tools.json --target npu162 \
+  --config kernel-tools.json --npu npu162 \
   --case-name smoke_b1 --output artifacts/smoke
 
 python -m kernel_tools run examples/fill_num_accepted.json \
-  --config kernel-tools.json --target npu162 --output artifacts/fill-all
+  --config kernel-tools.json --npu npu162 --output artifacts/fill-all
 ```
 
 工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造由统一测试框架提供，自动流程不生成辅助 Python 文件或单算子 reference。
@@ -204,7 +215,7 @@ python -m kernel_tools run examples/fill_num_accepted.json \
 查看计划而不连接远端：
 
 ```bash
-python -m kernel_tools run examples/fill_num_accepted.json --target npu165 --dry-run
+python -m kernel_tools run examples/fill_num_accepted.json --npu npu165 --dry-run
 ```
 
 ## 在 NPU 环境内直接运行
@@ -225,7 +236,7 @@ python -m kernel_tools run examples/fill_num_accepted.json \
 
 支持输入一个目录运行其中所有 `.json` / `.jsonl` case，支持 `--kernel` 和 `--case-name` 精确筛选。失败不会中止后续 case；Ctrl-C 会记录当前中断并把剩余项标为 blocked。设备环境不可用时所有选中 case 都有 blocked 结果。
 
-断点续跑使用完全相同的命令与 `--output`，追加 `--resume`。本地和 `--target` 远端运行都会复用成功项，只重跑未完成或失败 case。远端首次运行在本地输出目录保存 `remote-run.json`，恢复时复用其中的远端结果目录；若原远端进程仍在运行则拒绝重复启动。case、目标配置、工具代码、源码指纹或测量参数发生变化时拒绝复用。没有生成时源码指纹的手写 case 仍要求源码 Git 根目录干净。
+断点续跑使用完全相同的命令与 `--output`，追加 `--resume`。本地和 `--npu` 远端运行都会复用成功项，只重跑未完成或失败 case。远端首次运行在本地输出目录保存 `remote-run.json`，恢复时复用其中的远端结果目录；若原远端进程仍在运行则拒绝重复启动。case、目标配置、工具代码、source lock 或测量参数发生变化时拒绝复用。旧版没有 source lock 的手写 case 仍沿用原有运行规则。
 
 ## 结果只有需要的东西
 
@@ -234,6 +245,7 @@ artifacts/fill-all/
   cases/       # 真正执行的 case，每个算子一份
   results/     # 每个算子的所有场景结果和实际绑定
   logs/        # 仅失败场景的完整日志
+  source-lock.json  # 生成依据的本地 commit 与 Python 源码哈希（generate/pipeline）
   report.md    # 场景结果、耗时、失败原因与日志链接
 ```
 

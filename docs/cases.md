@@ -17,7 +17,7 @@
 }
 ```
 
-- `target` 必须指向可用 `kernel[grid](...)` 直接启动的 Triton JIT kernel，支持 `module:symbol` 或 `file.py:symbol`。远端路径以远端源码为准。
+- `target` 必须指向可用 `kernel[grid](...)` 直接启动的 Triton JIT kernel，支持 `module:symbol` 或 `file.py:symbol`。自动生成时先依据本地源码确定，运行前由 source lock 保证远端实际 import 的源码一致。
 - 框架不执行 Python wrapper，也不接受 `mode`、`wrapper` 或每次运行专用的 adapter。生产 wrapper 只用于推导参数关系、grid、constexpr 和 launch options。
 - `arguments` 是 keyword arguments，`args` 是 positional arguments。兼容旧 `kwargs`，但不能与 `arguments` 同时出现。
 - grid、constexpr、launch options 从真实生产 wrapper 提取；`num_warps` 等 launch 参数放在 `arguments` 中。旧 `launch_config` 仅是元数据，不影响执行。

@@ -14,10 +14,11 @@ from unittest.mock import patch
 from kernel_tools.benchmark import resolve_symbol, resolve_target
 from kernel_tools.cases import load_cases, select_cases, validate_cases
 from kernel_tools.common import save_json
-from kernel_tools.remote import safe_extract, target_command, run_remote
+from kernel_tools.remote import safe_extract, target_command, run_remote, verify_remote
 from kernel_tools.runner import device_lock, run_suite
 from kernel_tools.runner import new_run_path
 from kernel_tools.scan import compare, scan
+from kernel_tools.source_lock import local_source, make_source_lock, verify_source_lock
 
 
 def case(name="ok", kernel="test_kernel"):
@@ -93,6 +94,81 @@ class CasesTest(unittest.TestCase):
                  patch("kernel_tools.remote.run_remote", return_value=0) as remote:
                 self.assertEqual(main(["run", str(input_file), "--target", "test"]), 0)
             self.assertEqual(remote.call_args.kwargs["expected_identity"], "abc123")
+
+    def test_remote_run_reads_generation_source_lock(self):
+        from kernel_tools.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "generation"
+            lock = make_source_lock({"vllm": {"commit": "a" * 40, "dirty": False,
+                "files": {"vllm/kernel.py": "b" * 64}}})
+            generated = case()
+            generated["source"] = {"source_lock": lock["fingerprint"]}
+            save_json(root / "cases/case.json", [generated])
+            save_json(root / "source-lock.json", lock)
+            with patch("kernel_tools.remote.load_target", return_value={"device": "npu:0"}), \
+                 patch("kernel_tools.remote.run_remote", return_value=0) as remote:
+                self.assertEqual(main(["run", str(root), "--npu", "test"]), 0)
+            self.assertEqual(remote.call_args.kwargs["source_lock"]["fingerprint"], lock["fingerprint"])
+
+    def test_verify_routes_source_lock_to_npu(self):
+        from kernel_tools.cli import main
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            lock = make_source_lock({"vllm": {"commit": "a" * 40, "dirty": False,
+                "files": {"vllm/kernel.py": "b" * 64}}})
+            save_json(root / "source-lock.json", lock)
+            verified = {"status": "verified", "fingerprint": lock["fingerprint"], "packages": {}}
+            with patch("kernel_tools.remote.load_target", return_value={"device": "npu:0"}), \
+                 patch("kernel_tools.remote.verify_remote", return_value=verified) as remote, \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(main(["verify", str(root), "--npu", "test"]), 0)
+            remote.assert_called_once()
+
+
+class SourceLockTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        subprocess.run(["git", "-C", str(self.root), "init", "-q"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        package = self.root / "vllm_ascend"
+        package.mkdir()
+        (package / "__init__.py").write_text("# package\n")
+        (package / "kernel.py").write_text(
+            "import triton\n@triton.jit\ndef selected_kernel(x): return x\n")
+        (package / "caller.py").write_text(
+            "from .kernel import selected_kernel\ndef launch(x): selected_kernel[(1,)](x)\n")
+        (package / "unrelated.py").write_text("VALUE = 1\n")
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "fixture"], check=True)
+        self.head = subprocess.check_output(
+            ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_targeted_context_but_complete_package_lock(self):
+        context, packages = local_source(
+            self.root / "vllm_ascend/kernel.py", selectors=["selected_kernel"])
+        self.assertEqual(set(context), {
+            "vllm_ascend/kernel.py", "vllm_ascend/caller.py"})
+        self.assertIn("vllm_ascend/unrelated.py", packages["vllm_ascend"]["files"])
+        lock = make_source_lock(packages)
+        info = {"imports": {"vllm_ascend": str(self.root / "vllm_ascend/__init__.py")},
+                "source_revisions": {"vllm_ascend": {"head": self.head, "dirty": False}}}
+        self.assertEqual(verify_source_lock(lock, info)["status"], "verified")
+        (self.root / "vllm_ascend/unrelated.py").write_text("VALUE = 2\n")
+        with self.assertRaisesRegex(ValueError, "1 changed"):
+            verify_source_lock(lock, info)
+
+    def test_ref_reads_committed_source_instead_of_dirty_worktree(self):
+        kernel = self.root / "vllm_ascend/kernel.py"
+        kernel.write_text("BROKEN WORKTREE\n")
+        context, packages = local_source(kernel, ref=self.head, selectors=["selected_kernel"])
+        self.assertIn("@triton.jit", context["vllm_ascend/kernel.py"])
+        self.assertFalse(packages["vllm_ascend"]["dirty"])
+        self.assertEqual(packages["vllm_ascend"]["commit"], self.head)
 
 
 FAKE_WORKER = r'''
@@ -267,6 +343,40 @@ def launch(x): external[(1,)](x)
         self.assertNotIn("body", changed["changes"])
 
 class TransportTest(unittest.TestCase):
+    def test_remote_run_stops_when_source_verification_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "download"
+            lock = make_source_lock({"vllm": {"commit": "a" * 40, "dirty": False,
+                "files": {"vllm/kernel.py": "b" * 64}}})
+            target = {"host": "simulated", "cwd": str(Path(tmp)), "python": sys.executable,
+                      "result_root": str(Path(tmp) / "remote")}
+            with patch("kernel_tools.remote.verify_remote",
+                       side_effect=ValueError("Source verification failed: vllm commit differs")):
+                with self.assertRaisesRegex(ValueError, "Source verification failed"):
+                    run_remote(target, [case()], output, source_lock=lock)
+            self.assertFalse(output.exists())
+
+    def test_remote_source_verification_with_local_transport(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            package = source / "vllm"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text("# fixture\n")
+            (package / "kernel.py").write_text("VALUE = 1\n")
+            for args in (("init", "-q"), ("config", "user.email", "test@example.invalid"),
+                         ("config", "user.name", "Test"), ("add", "."),
+                         ("commit", "-qm", "fixture")):
+                subprocess.run(["git", "-C", str(source), *args], check=True)
+            _, packages = local_source(package)
+            lock = make_source_lock(packages)
+            target = {"host": "simulated", "cwd": str(source), "python": sys.executable,
+                      "pythonpath": [str(source)], "result_root": str(root / "remote")}
+            with patch("kernel_tools.remote.ssh_command", side_effect=lambda t, c: ["bash", "-c", c]):
+                result = verify_remote(target, lock)
+            self.assertEqual(result["status"], "verified")
+            self.assertEqual(result["packages"]["vllm"]["commit"], packages["vllm"]["commit"])
+
     def test_upload_execute_download_with_local_ssh_transport(self):
         # Exercise real tar transfer / subprocess execution / result download,
         # replacing only the SSH wire with a local shell. No NPU or network.

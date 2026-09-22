@@ -14,7 +14,8 @@ TENSOR_KEYS = {"shape", "dtype", "device", "initializer", "value", "low", "high"
 
 def load_cases(path):
     path = Path(path)
-    paths = sorted([*path.glob("*.json"), *path.glob("*.jsonl")]) if path.is_dir() else [path]
+    paths = (sorted([p for p in [*path.glob("*.json"), *path.glob("*.jsonl")]
+                     if p.name != "source-lock.json"]) if path.is_dir() else [path])
     cases = []
     for file in paths:
         text = file.read_text(encoding="utf-8").strip()

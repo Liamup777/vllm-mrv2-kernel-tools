@@ -15,13 +15,14 @@ from pathlib import Path
 from .ai import CASE_SCHEMA, DIAGNOSIS_SCHEMA, Codex, describe_codex, resolve_codex
 from .cases import validate_cases
 from .common import file_key, save_json
-from .remote import fetch_snapshot, load_target, run_remote
+from .remote import load_target, run_remote
 from .scan import Module, write_scan
 from .review import (REVIEW_POLICY_VERSION, instructions, load_scan_result,
                      resource_root, review_sources, write_sources)
+from .source_lock import local_source, make_source_lock, package_lock
 
 
-CASE_POLICY_VERSION = 3
+CASE_POLICY_VERSION = 4
 
 
 def validate_bundle(bundle, operator, runtime_sources):
@@ -96,7 +97,7 @@ def resolve_named_kernels(target_sources, selectors):
         matches = [item for item in definitions
                    if item[0] == selector or item[2].name == selector]
         if not matches:
-            raise ValueError(f"Triton JIT kernel not found in remote imported sources: {selector}")
+            raise ValueError(f"Triton JIT kernel not found in selected local sources: {selector}")
         if len(matches) > 1:
             identities = ", ".join(sorted(item[0] for item in matches))
             raise ValueError(f"Kernel name is ambiguous; use a full Python ID for {selector}: {identities}")
@@ -109,19 +110,44 @@ def resolve_named_kernels(target_sources, selectors):
             "kernel": definition.name,
             "definition": path,
             "classification": "selected",
-            "reason": "用户显式指定该 Triton JIT kernel 生成单算子用例。",
-            "evidence": f"目标 tag 定义：{path}:{definition.lineno}",
+            "reason": "用户显式指定该本地 Triton JIT kernel 生成单算子用例。",
+            "evidence": f"本地源码定义：{path}:{definition.lineno}",
         })
     return selected
+
+
+def _add_local_sources(paths, *, selectors=(), ref=None):
+    context, packages = {}, {}
+    roots = []
+    for path in paths:
+        selected, locked = local_source(path, ref=ref, selectors=selectors)
+        for name, source in selected.items():
+            if name in context and context[name] != source:
+                raise ValueError(f"Conflicting local source contents for {name}")
+            context[name] = source
+        for package, identity in locked.items():
+            if package in packages and packages[package]["files"] != identity["files"]:
+                raise ValueError(f"Package {package} was selected from different local source states")
+            packages[package] = identity
+            roots.append(identity.get("local_root"))
+    return context, packages, sorted(set(x for x in roots if x))
+
+
+def _write_context(destination, sources):
+    for name, source in sources.items():
+        path = destination / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
 
 
 def render_pipeline(root, state, execution_report=""):
     def safe(value):
         return str(value).replace("|", "\\|").replace("\n", " ")
-    version = ("源码：远端环境实际导入的 `vllm` / `vllm_ascend`" if state.get("selection_mode") == "manual"
+    version = ("源码：本地选择的 `vllm` / `vllm_ascend`" if state.get("selection_mode") == "manual"
                else f"版本：`{state['base']}` → `{state['target']}`")
+    target = f"；NPU 目标：`{state['npu']}`" if state.get("npu") else ""
     lines = ["# Triton 单算子测试报告", "",
-             f"{version}；NPU 目标：`{state['npu']}`。", "",
+             f"{version}{target}。", "",
              f"流程状态：**{state['status']}**；当前/最后阶段：`{state['stage']}`。", "",
              f"生成用例目录：`{state['cases_path']}`。", "",
              "静态扫描和 AI 复核仍可能遗漏动态路径；数值检查通过仅代表所列输入。", ""]
@@ -145,6 +171,13 @@ def render_pipeline(root, state, execution_report=""):
                   f"`{ai.get('model')}`（{ai.get('model_source')}），"
                   f"推理强度 `{ai.get('reasoning_effort') or '由 Codex 配置决定'}`；"
                   "release review、逐算子 case 生成和失败分析是独立调用。", ""]
+    if state.get("source_packages"):
+        lines += ["源码锁：`" + state.get("source_lock", "") + "`。", ""]
+        for name, package in state["source_packages"].items():
+            lines += [f"- `{name}`：commit `{package['commit']}`；"
+                      f"Python 文件 {package['file_count']}；"
+                      f"生成时源码状态 `{'dirty' if package['dirty'] else 'clean/tag snapshot'}`。"]
+        lines.append("")
     review = state.get("review", {})
     if review:
         lines += [review["summary"], "", "| 算子 | AI 判断 | 用例生成 | 原因 |", "|---|---|---|---|"]
@@ -172,11 +205,16 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                       device=None, warmup=10, rounds=100, timeout=600,
                       prepare_only=False, dry_run=False, ai_client=None,
                       cases_output=None, resume=False, scan_input=None, selected_kernels=None,
-                      operation="pipeline"):
+                      source_paths=(), source_ref=None, operation="pipeline"):
     selected_kernels = list(selected_kernels or [])
-    target_config = load_target(config, npu)
+    source_paths = [Path(path).expanduser().resolve() for path in source_paths]
+    if selected_kernels and not source_paths:
+        raise ValueError("generate --kernel requires at least one local --source file or directory")
+    if source_ref and not selected_kernels:
+        raise ValueError("--ref is only supported with generate --kernel")
+    target_config = load_target(config, npu) if npu else None
     configured_codex = resolve_codex(config, codex)
-    device = device or target_config.get("device", "npu:0")
+    device = device or (target_config.get("device", "npu:0") if target_config else "npu:0")
     if warmup < 0 or rounds < 1 or not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("Require warmup >= 0, rounds > 0 and a finite positive timeout")
     if not device.startswith("npu:") or not device[4:].isdigit():
@@ -188,7 +226,9 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
         if not workflow.is_file():
             raise ValueError(f"Cannot resume without {workflow}")
         prior = json.loads(workflow.read_text())
-        expected_run = {"base": base, "target": target, "npu": npu}
+        expected_run = {"base": base, "target": target, "npu": npu,
+                        "source_paths": [str(path) for path in source_paths],
+                        "source_ref": source_ref}
         if selected_kernels or "selected_kernels" in prior:
             expected_run["selected_kernels"] = selected_kernels
         mismatched = [k for k, value in expected_run.items() if prior.get(k) != value]
@@ -207,24 +247,31 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
         raise ValueError("--cases-output must be a separate case directory")
     if dry_run:
         ai_plan = describe_codex(configured_codex, model, ai_timeout, reasoning_effort)
-        steps = (["read actual NPU sources", "resolve explicitly selected kernels", "skip release review"]
+        steps = (["read selected local sources", "resolve explicitly selected kernels", "skip release review"]
                  if selected_kernels else
                  ["verify reusable scan result" if scan_input else "scan",
                   "reuse AI review" if scan_input or (resume and prior.get("review"))
-                  else "AI review with release skill", "read actual NPU sources"])
-        plan = {"npu": npu, "device": device,
+                  else "AI review with release skill", "read local generation sources"])
+        plan = {"device": device,
             "steps": [*steps, "AI JSON cases with case skill", "validate",
-                      "stop after generation" if prepare_only else "NPU run and failure analysis"],
+                      "stop after generation" if prepare_only else
+                      "verify locked remote sources, NPU run and failure analysis"],
             "AI": {**ai_plan, "command": [configured_codex, "exec"]},
             "output": str(root), "cases_output": str(cases_dir),
             "resume": resume,
             "note": "No AI request, SSH connection or NPU job started"}
+        if npu:
+            plan["npu"] = npu
         if base is not None:
             plan["base"] = base
         if target is not None:
             plan["target"] = target
+        if source_paths:
+            plan["sources"] = [str(path) for path in source_paths]
         if selected_kernels:
             plan["kernels"] = selected_kernels
+            if source_ref:
+                plan["ref"] = source_ref
         print(json.dumps(plan, ensure_ascii=False, indent=2))
         return 0
     if not resume and root.exists() and any(root.iterdir()):
@@ -232,10 +279,11 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
     if not resume and cases_dir.exists() and (not cases_dir.is_dir() or any(cases_dir.iterdir())):
         raise ValueError(f"Case output already exists: {cases_dir}; use a new or empty directory")
     root.mkdir(parents=True, exist_ok=True)
-    state = prior or {"schema_version": 2, "base": base, "target": target, "npu": npu,
+    state = prior or {"schema_version": 3, "base": base, "target": target, "npu": npu,
                       "status": "running", "stage": operation, "operation": operation, "generation": {},
                       "cases_path": str(cases_dir), "scope": scope, "stage_history": [],
                       "selected_kernels": selected_kernels,
+                      "source_paths": [str(path) for path in source_paths], "source_ref": source_ref,
                       "selection_mode": "manual" if selected_kernels else "release_scan"}
     state["operation"] = operation
     if resume:
@@ -270,17 +318,16 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
         with tempfile.TemporaryDirectory(prefix="kernel-tools-pipeline-") as tmp:
             workspace = Path(tmp)
             if selected_kernels:
-                stage(f"Read actual sources from {npu}", "1/3")
-                snapshot = fetch_snapshot(target_config, workspace / "runtime", device=device,
-                                          failure_log=root / "logs/snapshot.log")
-                state["runtime"] = snapshot
-                runtime_sources = {p: (workspace / "runtime" / p).read_text()
-                                   for p in snapshot["identity"]["files"]}
-                stage("Resolve explicitly selected kernels from remote sources", "2/3")
+                stage("Read selected local sources", "1/3")
+                runtime_sources, package_locks, local_roots = _add_local_sources(
+                    source_paths, selectors=selected_kernels, ref=source_ref)
+                _write_context(workspace / "source", runtime_sources)
+                stage("Resolve explicitly selected kernels from local sources", "2/3")
                 operators = resolve_named_kernels(runtime_sources, selected_kernels)
                 review = {"operators": operators, "unresolved": [],
-                          "summary": f"用户显式选择 {len(operators)} 个远端 Triton JIT kernel；未执行版本差异扫描。"}
+                          "summary": f"用户显式选择 {len(operators)} 个本地 Triton JIT kernel；未执行版本差异扫描。"}
                 state["review"] = review
+                state["local_source_roots"] = local_roots
                 incomplete = False
                 commit = None
             else:
@@ -328,6 +375,32 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 operators = [r for r in review["operators"] if r["classification"] == "new"]
                 incomplete = bool(review["unresolved"] or any(
                     r["classification"] == "needs_review" for r in review["operators"]))
+                stage("Read local generation sources",
+                      "2/3" if operation == "generate" else "3/6")
+                runtime_sources = dict(target_sources)
+                package_locks = {"vllm": package_lock(
+                    "vllm", commit, target_sources, ref=target, local_root=repo)}
+                extra_sources, extra_locks, local_roots = _add_local_sources(source_paths)
+                for name, source in extra_sources.items():
+                    if name in runtime_sources and runtime_sources[name] != source:
+                        raise ValueError(f"Local --source conflicts with target-tag source: {name}")
+                    runtime_sources[name] = source
+                for package, identity in extra_locks.items():
+                    if package in package_locks and package_locks[package]["files"] != identity["files"]:
+                        raise ValueError(f"Local --source conflicts with locked {package} target sources")
+                    package_locks[package] = identity
+                _write_context(workspace / "source", extra_sources)
+                state["local_source_roots"] = [str(Path(repo).resolve()), *local_roots]
+            source_lock = make_source_lock(package_locks)
+            state["source_lock"] = source_lock["fingerprint"]
+            state["source_packages"] = {name: {
+                "commit": package["commit"], "dirty": package["dirty"],
+                "file_count": len(package["files"]),
+            } for name, package in source_lock["packages"].items()}
+            save_json(root / "source-lock.json", source_lock)
+            (workspace / "source").mkdir(exist_ok=True)
+            if cases_dir.parent != root:
+                save_json(cases_dir / "source-lock.json", source_lock)
             operator_ids = {r["id"] for r in operators}
             # Old pipeline revisions generated per-run adapter modules. They are
             # incompatible with the JSON-only case policy and must not leak into
@@ -346,37 +419,6 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 state["status"] = "needs_review" if incomplete else "no_new_operators"
                 persist()
                 return 1 if incomplete else 0
-            if not selected_kernels:
-                stage(f"Read and verify actual sources on {npu}",
-                      "2/3" if operation == "generate" else "3/6")
-                snapshot = fetch_snapshot(target_config, workspace / "runtime", device=device,
-                                          failure_log=root / "logs/snapshot.log")
-                state["runtime"] = snapshot
-                expected = {p: hashlib.sha256(s.encode()).hexdigest() for p, s in target_sources.items()}
-                actual = {p: h for p, h in snapshot["identity"]["files"].items() if p.startswith("vllm/")}
-                if expected != actual:
-                    changed = sorted(p for p in expected.keys() & actual.keys() if expected[p] != actual[p])
-                    missing = sorted(expected.keys() - actual.keys())
-                    extra = sorted(actual.keys() - expected.keys())
-                    drift = changed + missing + extra
-                    state["source_drift"] = {
-                        "changed_count": len(changed), "missing_count": len(missing),
-                        "extra_count": len(extra), "examples": drift[:20],
-                        "target_commit": commit,
-                        "remote_package_version": snapshot["environment"].get("packages", {}).get("vllm"),
-                        "remote_head": snapshot["environment"].get("source_revisions", {}).get("vllm", {}).get("head"),
-                        "remote_fingerprint": snapshot["identity"]["fingerprint"],
-                    }
-                    raise ValueError(f"Remote vLLM differs from {target}: {len(changed)} changed, "
-                                     f"{len(missing)} missing and {len(extra)} extra Python files. "
-                                     "The remote imported source must match the target exactly; "
-                                     "align the remote environment, then resume this output with --resume")
-                else:
-                    state.pop("source_drift", None)
-                if not snapshot["environment"].get("npu_available") and not prepare_only:
-                    raise ValueError("NPU unavailable: " + snapshot["environment"].get("npu_error", "environment probe failed"))
-                runtime_sources = {p: (workspace / "runtime" / p).read_text()
-                                   for p in snapshot["identity"]["files"]}
             cases = []
             for index, operator in enumerate(operators, 1):
                 key = file_key(operator["id"])
@@ -385,10 +427,10 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 if (resume and saved.get("status") == "ready" and
                         saved.get("case_policy_version") == CASE_POLICY_VERSION and case_file.is_file()):
                     generated = json.loads(case_file.read_text())
-                    fingerprints = {c.get("source", {}).get("runtime_fingerprint") for c in generated}
-                    if fingerprints != {snapshot["identity"]["fingerprint"]}:
-                        raise ValueError(f"Saved cases for {operator['kernel']} use a different remote source "
-                                         "fingerprint; start a new output directory")
+                    fingerprints = {c.get("source", {}).get("source_lock") for c in generated}
+                    if fingerprints != {source_lock["fingerprint"]}:
+                        raise ValueError(f"Saved cases for {operator['kernel']} use a different local source "
+                                         "lock; start a new output directory")
                     bundle = {"status": "ready", "reason": saved.get("reason", ""),
                               "analysis": saved.get("analysis", ""),
                               "cases_json": json.dumps(generated)}
@@ -400,14 +442,14 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 stage(f"Generate cases {index}/{len(operators)}: {operator['kernel']}",
                       "3/3" if operation == "generate" else "4/6")
                 source_guidance = (
-                    "Read runtime/ as the authoritative ACTUAL imported NPU sources. "
+                    "Read source/ as the authoritative selected LOCAL sources. "
                     if selected_kernels else
-                    "Read target/ for intended upstream behavior and runtime/ for ACTUAL imported NPU sources. "
+                    "Read target/ for exact upstream target-tag sources and source/ for additional LOCAL binding sources. "
                 )
                 task = ("Generate multi-scenario cases for this operator:\n" + json.dumps(operator, ensure_ascii=False)
                     + "\n" + source_guidance +
-                    "runtime/snapshot.json records versions. Resolve Ascend patches and imports from runtime; "
-                    "do not assume the upstream implementation is the effective replacement. Explain the selected "
+                    "The controller records a source lock outside this AI workspace; do not contact or inspect an NPU host. "
+                    "Resolve Ascend patches and imports only from supplied local sources. Explain the selected "
                     "binding, shape/index/stride/pointer/alias/reset contract, coverage and measurement scope in analysis. "
                     "Return cases_json as a JSON array string. Every case must have "
                     f"kernel={operator['kernel']!r} and a scenario description. Use only the JSON materializer "
@@ -448,13 +490,13 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                     continue
                 for case in generated:
                     source = {"operator_id": operator["id"],
-                              "runtime_fingerprint": snapshot["identity"]["fingerprint"]}
+                              "source_lock": source_lock["fingerprint"]}
                     if commit:
                         source["target_commit"] = commit
                     else:
                         package = operator["definition"].split("/", 1)[0]
-                        revision = snapshot["environment"].get("source_revisions", {}).get(package, {})
-                        source.update(package=package, revision=revision.get("head"),
+                        revision = source_lock["packages"].get(package, {})
+                        source.update(package=package, revision=revision.get("commit"),
                                       dirty=revision.get("dirty"))
                     case["source"] = source
                 save_json(cases_dir / (key + ".json"), generated)
@@ -465,11 +507,11 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 persist()
                 return 1 if incomplete or not cases else 0
             validate_cases(cases)
-            stage(f"Execute {len(cases)} generated cases on {npu}", "5/6")
+            stage(f"Verify locked sources and execute {len(cases)} generated cases on {npu}", "5/6")
             execution = workspace / "execution"
             code = run_remote(target_config, cases, execution, device=device, warmup=warmup,
                               rounds=rounds, timeout=timeout,
-                              expected_identity=snapshot["identity"]["fingerprint"])
+                              source_lock=source_lock)
             execution_report = (execution / "report.md").read_text()
             for name in ("results", "logs"):
                 if (execution / name).exists():
@@ -494,7 +536,7 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 shutil.copytree(cases_dir, workspace / "cases")
                 try:
                     diagnosis = ai.ask(instructions("vllm-triton-remote-benchmark",
-                        "Analyze failed/blocked cases from results/, full logs/, cases/ and runtime/. "
+                        "Analyze failed/blocked cases from results/, full logs/, cases/, target/ and source/. "
                         "Do not run tests or modify files. Report observed errors separately from inferred cause, "
                         "cite concrete log/source paths and evidence, state uncertainty, and distinguish input, "
                         "reference, import, compile, runtime, correctness and environment failures. Do not change "
@@ -527,19 +569,20 @@ def pipeline(repo, base, target, npu, config, output, **kwargs):
                              operation="pipeline", **kwargs)
 
 
-def generate_from_scan(scan_input, repo, npu, config, output, **kwargs):
+def generate_from_scan(scan_input, repo, output, *, sources=(), config=None, **kwargs):
     """Generate reusable direct-Triton cases from a completed scan artifact."""
     _, document = load_scan_result(scan_input)
     return _execute_workflow(repo, document["base"]["tag"], document["target"]["tag"],
-                             npu, config, output, scope=document["scope"],
+                             None, config, output, scope=document["scope"], source_paths=sources,
                              prepare_only=True, scan_input=scan_input,
                              operation="generate", **kwargs)
 
 
-def generate_from_kernels(kernels, npu, config, output, **kwargs):
-    """Generate cases for explicitly selected kernels from actual remote sources."""
+def generate_from_kernels(kernels, sources, output, *, ref=None, config=None, **kwargs):
+    """Generate cases for explicitly selected kernels from bounded local sources."""
     if not kernels or not all(isinstance(name, str) and name.strip() for name in kernels):
         raise ValueError("At least one nonempty --kernel is required")
-    return _execute_workflow(None, None, None, npu, config, output,
+    return _execute_workflow(None, None, None, None, config, output,
                              prepare_only=True, selected_kernels=kernels,
+                             source_paths=sources, source_ref=ref,
                              operation="generate", **kwargs)

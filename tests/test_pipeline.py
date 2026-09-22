@@ -13,7 +13,7 @@ from kernel_tools.ai import CASE_SCHEMA, DIAGNOSIS_SCHEMA, REVIEW_SCHEMA, Codex
 from kernel_tools.common import save_json
 from kernel_tools.pipeline import pipeline, validate_bundle
 from kernel_tools.remote import fetch_snapshot
-from kernel_tools.snapshot import source_files, source_identity
+from kernel_tools.snapshot import source_files
 
 
 SOURCE = """import triton
@@ -89,17 +89,8 @@ class PipelineTest(unittest.TestCase):
         self.git("commit", "-qm", tag)
         self.git("tag", tag)
 
-    def snapshot(self, target, destination, **kwargs):
-        file = destination / PATH
-        file.parent.mkdir(parents=True)
-        file.write_text(SOURCE)
-        info = {"npu_available": True, "packages": {"triton-ascend": "test"}, "python": "test"}
-        value = {"environment": info, "identity": source_identity(info, {PATH: SOURCE.encode()})}
-        save_json(destination / "snapshot.json", value)
-        return value
-
     def execute(self, target, cases, output, **kwargs):
-        self.assertTrue(kwargs["expected_identity"])
+        self.assertTrue(kwargs["source_lock"]["fingerprint"])
         output.mkdir()
         save_json(output / "results/added.json", {"kernel": "added", "scenarios": [
             {"name": c["name"], "status": "success", "correctness": "not_checked"} for c in cases]})
@@ -115,26 +106,26 @@ class PipelineTest(unittest.TestCase):
         return json.loads((self.output / "workflow.json").read_text())
 
     def test_complete_pipeline_and_minimal_artifacts(self):
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
             self.assertEqual(self.run_flow(), 0)
         self.assertEqual(self.state()["status"], "completed")
         self.assertEqual(len(self.ai.calls), 2)
         self.assertIn("Apply this skill", self.ai.calls[0][0])
         self.assertEqual({p.name for p in self.output.iterdir()},
-                         {"cases", "results", "workflow.json", "report.md"})
+                         {"cases", "results", "source-lock.json", "workflow.json", "report.md"})
+        lock = json.loads((self.output / "source-lock.json").read_text())
+        self.assertEqual(lock["packages"]["vllm"]["commit"], self.state()["delta"]["target"]["commit"])
 
-    def test_missing_candidate_blocks_before_ssh(self):
+    def test_missing_candidate_blocks_before_remote_run(self):
         self.ai.omit = True
-        with patch("kernel_tools.pipeline.fetch_snapshot") as snapshot:
+        with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(), 1)
-            snapshot.assert_not_called()
+            remote.assert_not_called()
         self.assertIn("omitted candidates", self.state()["error"])
 
     def test_invalid_case_retries_once_and_never_executes(self):
         self.ai.fail_cases = True
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote:
+        with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(), 1)
             remote.assert_not_called()
         self.assertEqual(len(self.ai.calls), 3)
@@ -142,59 +133,50 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(len(list((self.output / "logs").glob("generation*.log"))), 2)
 
     def test_prepare_only_does_not_execute(self):
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote:
+        with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(prepare_only=True), 0)
             remote.assert_not_called()
         self.assertEqual(self.state()["status"], "prepared")
 
     def test_resume_reuses_review_and_generated_cases(self):
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote:
+        with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(prepare_only=True), 0)
             remote.assert_not_called()
         self.assertEqual(len(self.ai.calls), 2)
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
             self.assertEqual(self.run_flow(resume=True), 0)
         self.assertEqual(len(self.ai.calls), 2)
         self.assertEqual(self.state()["status"], "completed")
         self.assertTrue(self.state()["resumes"])
 
     def test_resume_rechecks_review_when_scope_policy_changed(self):
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote:
+        with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(prepare_only=True), 0)
             remote.assert_not_called()
         state = self.state()
         state.pop("review_policy_version")
         save_json(self.output / "workflow.json", state)
         calls = len(self.ai.calls)
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
             self.assertEqual(self.run_flow(resume=True), 0)
         self.assertEqual(len(self.ai.calls), calls + 1)
 
-    def test_resume_after_remote_source_is_aligned_reuses_review(self):
-        def drift(*args, **kwargs):
-            value = self.snapshot(*args, **kwargs)
-            value["identity"]["files"][PATH] = "different"
-            return value
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=drift):
+    def test_resume_after_remote_source_is_aligned_reuses_generated_cases(self):
+        with patch("kernel_tools.pipeline.run_remote",
+                   side_effect=ValueError("Source verification failed: vllm commit differs")):
             self.assertEqual(self.run_flow(), 1)
-        self.assertEqual(len(self.ai.calls), 1)
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+        self.assertEqual(len(self.ai.calls), 2)
+        with patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
             self.assertEqual(self.run_flow(resume=True), 0)
         self.assertEqual(len(self.ai.calls), 2)
 
     def test_custom_case_directory_is_saved_and_reported(self):
         case_dir = self.root / "generated-cases"
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=self.execute):
             self.assertEqual(self.run_flow(cases_output=case_dir), 0)
         self.assertEqual(self.state()["cases_path"], str(case_dir.resolve()))
-        self.assertEqual(len(list(case_dir.glob("*.json"))), 1)
+        self.assertEqual(len([p for p in case_dir.glob("*.json") if p.name != "source-lock.json"]), 1)
+        self.assertTrue((case_dir / "source-lock.json").is_file())
         self.assertFalse((self.output / "cases").exists())
         self.assertIn(str(case_dir.resolve()), (self.output / "report.md").read_text())
 
@@ -216,24 +198,19 @@ class PipelineTest(unittest.TestCase):
                 {"name": "smoke", "status": "failed", "correctness": "not_checked"}]})
             return 1
 
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=failed_run):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=failed_run):
             self.assertEqual(self.run_flow(cases_output=case_dir), 1)
         self.assertEqual(self.state()["status"], "failed")
-        self.assertEqual(len(list(case_dir.glob("*.json"))), 1)
+        self.assertEqual(len([p for p in case_dir.glob("*.json") if p.name != "source-lock.json"]), 1)
         self.assertEqual(len(self.ai.calls), 3)
 
-    def test_source_mismatch_blocks_generation_and_execution(self):
-        def drift(*args, **kwargs):
-            value = self.snapshot(*args, **kwargs)
-            value["identity"]["files"][PATH] = "different"
-            return value
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=drift), \
-             patch("kernel_tools.pipeline.run_remote") as remote:
+    def test_source_mismatch_blocks_execution_after_local_generation(self):
+        with patch("kernel_tools.pipeline.run_remote",
+                   side_effect=ValueError("Source verification failed: changed source")):
             self.assertEqual(self.run_flow(), 1)
-            remote.assert_not_called()
-        self.assertEqual(len(self.ai.calls), 1)
-        self.assertIn("differs", self.state()["error"])
+        self.assertEqual(len(self.ai.calls), 2)
+        self.assertIn("Source verification failed", self.state()["error"])
+        self.assertEqual(len(list((self.output / "cases").glob("*.json"))), 1)
 
     def test_failed_run_keeps_full_log_and_calls_diagnosis(self):
         def fail(*args, **kwargs):
@@ -244,8 +221,7 @@ class PipelineTest(unittest.TestCase):
             (output / "logs").mkdir()
             (output / "logs/failure.log").write_text("CompilationError: full diagnostic\n")
             return 1
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=fail):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=fail):
             self.assertEqual(self.run_flow(), 1)
         self.assertEqual(self.state()["status"], "failed")
         self.assertEqual((self.output / "logs/failure.log").read_text(), "CompilationError: full diagnostic\n")
@@ -256,8 +232,7 @@ class PipelineTest(unittest.TestCase):
             self.execute(*args, **kwargs)
             save_json(args[2] / "results/added.json", {"kernel": "added", "scenarios": []})
             return 0
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=self.snapshot), \
-             patch("kernel_tools.pipeline.run_remote", side_effect=incomplete):
+        with patch("kernel_tools.pipeline.run_remote", side_effect=incomplete):
             self.assertEqual(self.run_flow(), 1)
         self.assertIn("exactly the generated cases", self.state()["error"])
 
@@ -394,14 +369,12 @@ class ReviewCommandTest(unittest.TestCase):
                                           ai_client=f.ai), 0)
         self.assertEqual(len(f.ai.calls), 1)
         output = io.StringIO()
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote, \
-             contextlib.redirect_stdout(output):
-            self.assertEqual(generate_from_scan(scan_output, f.repo, "test", f.config,
-                                                generation_output, ai_client=f.ai), 0)
+        with patch("kernel_tools.pipeline.run_remote") as remote, contextlib.redirect_stdout(output):
+            self.assertEqual(generate_from_scan(scan_output, f.repo, generation_output,
+                                                config=f.config, ai_client=f.ai), 0)
             remote.assert_not_called()
         self.assertIn("[generate 1/3] Verify scan result", output.getvalue())
-        self.assertIn("[generate 2/3] Read and verify actual sources", output.getvalue())
+        self.assertIn("[generate 2/3] Read local generation sources", output.getvalue())
         self.assertIn("[generate 3/3] Generate cases", output.getvalue())
         self.assertNotIn("[pipeline", output.getvalue())
         self.assertEqual(len(f.ai.calls), 2)
@@ -417,17 +390,15 @@ class ReviewCommandTest(unittest.TestCase):
         f = self.fixture
         generation_output = f.root / "manual-generation"
         output = io.StringIO()
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
-             patch("kernel_tools.pipeline.run_remote") as remote, \
-             contextlib.redirect_stdout(output):
-            self.assertEqual(generate_from_kernels(["added"], "test", f.config,
-                                                   generation_output,
+        with patch("kernel_tools.pipeline.run_remote") as remote, contextlib.redirect_stdout(output):
+            self.assertEqual(generate_from_kernels(["added"], [f.repo / PATH], generation_output,
+                                                   config=f.config,
                                                    ai_client=f.ai), 0)
             remote.assert_not_called()
         self.assertEqual(len(f.ai.calls), 1)
         self.assertEqual(f.ai.calls[0][1], CASE_SCHEMA)
-        self.assertIn("[generate 1/3] Read actual sources", output.getvalue())
-        self.assertIn("[generate 2/3] Resolve explicitly selected kernels", output.getvalue())
+        self.assertIn("[generate 1/3] Read selected local sources", output.getvalue())
+        self.assertIn("[generate 2/3] Resolve explicitly selected kernels from local sources", output.getvalue())
         self.assertNotIn("release review", output.getvalue())
         state = json.loads((generation_output / "workflow.json").read_text())
         self.assertEqual(state["selection_mode"], "manual")
@@ -437,12 +408,12 @@ class ReviewCommandTest(unittest.TestCase):
     def test_explicit_kernel_requires_unique_target_tag_jit(self):
         from kernel_tools.pipeline import generate_from_kernels
         f = self.fixture
-        with patch("kernel_tools.pipeline.fetch_snapshot", side_effect=f.snapshot), \
-             contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(generate_from_kernels(["missing"], "test", f.config,
-                                                   f.root / "missing", ai_client=f.ai), 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(generate_from_kernels(["missing"], [f.repo / PATH],
+                                                   f.root / "missing", config=f.config,
+                                                   ai_client=f.ai), 1)
         state = json.loads((f.root / "missing/workflow.json").read_text())
-        self.assertIn("Triton JIT kernel not found in remote imported sources", state["error"])
+        self.assertIn("Triton JIT kernel not found in selected local sources", state["error"])
         self.assertEqual(len(f.ai.calls), 0)
 
     def test_explicit_kernel_resolves_vllm_ascend_runtime_source(self):
@@ -456,13 +427,13 @@ class ReviewCommandTest(unittest.TestCase):
         from kernel_tools.cli import main
         with patch("kernel_tools.pipeline.generate_from_scan", return_value=0) as generate:
             self.assertEqual(main(["generate", "--scan", "scan-output", "--repo", ".",
-                                   "--npu", "test", "--output", "generation-output"]), 0)
+                                   "--output", "generation-output"]), 0)
             generate.assert_called_once()
 
     def test_cli_generate_routes_explicit_kernel(self):
         from kernel_tools.cli import main
         with patch("kernel_tools.pipeline.generate_from_kernels", return_value=0) as generate:
-            self.assertEqual(main(["generate", "--kernel", "added", "--npu", "test",
+            self.assertEqual(main(["generate", "--kernel", "added", "--source", str(self.fixture.repo / PATH),
                                    "--output", "generation-output"]), 0)
             generate.assert_called_once()
 

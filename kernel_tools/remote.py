@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 
 from .common import digest, save_json
+from .source_lock import validate_source_lock
 
 
 def load_target(config, name):
@@ -106,6 +107,57 @@ def fetch_snapshot(target, destination, *, device="npu:0", failure_log=None):
             raise ValueError(f"Remote source snapshot failed: {error}") from error
 
 
+def verify_remote(target, source_lock, *, device="npu:0", dry_run=False):
+    """Verify the locked local source against the target's actual imports."""
+    validate_source_lock(source_lock)
+    token = uuid.uuid4().hex
+    stage = "/tmp/kernel-tools-verify-" + token
+    argv = [target["python"], "-m", "kernel_tools", "verify", stage + "/source-lock.json",
+            "--device", device]
+    command = target_command(target, argv, tool_root=stage, setup_stderr=True)
+    if dry_run:
+        return {"status": "planned", "fingerprint": source_lock["fingerprint"],
+                "host": target["host"], "container": target.get("container"),
+                "command": command,
+                "note": "No SSH connection or source verification performed"}
+    staged = False
+    try:
+        with tempfile.TemporaryDirectory(prefix="kernel-tools-verify-upload-") as tmp:
+            bundle = Path(tmp) / "bundle.tar"
+            lock_file = Path(tmp) / "source-lock.json"
+            save_json(lock_file, source_lock)
+            with tarfile.open(bundle, "w") as tar:
+                for source in sorted(Path(__file__).parent.glob("*.py")):
+                    tar.add(source, arcname="kernel_tools/" + source.name)
+                tar.add(lock_file, arcname="source-lock.json")
+            checked_ssh(target, shlex.join(["mkdir", "-p", stage]))
+            staged = True
+            with bundle.open("rb") as file:
+                checked_ssh(target, shlex.join(["tar", "-xf", "-", "-C", stage]), stdin=file)
+            if target.get("container"):
+                checked_ssh(target, shlex.join(["docker", "cp", stage, target["container"] + ":" + stage]))
+            result = subprocess.run(ssh_command(target, command), capture_output=True, text=True)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()[-4000:]
+                raise ValueError(detail or f"Remote source verification exited with {result.returncode}")
+            lines = [line for line in result.stdout.splitlines() if line.strip()]
+            if not lines:
+                raise ValueError("Remote source verification returned no result")
+            value = json.loads(lines[-1])
+            if value.get("fingerprint") != source_lock["fingerprint"]:
+                raise ValueError("Remote source verification returned the wrong lock fingerprint")
+            return value
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+        raise ValueError(f"Remote source verification failed: {error}") from error
+    finally:
+        if staged:
+            commands = []
+            if target.get("container"):
+                commands.append(shlex.join(["docker", "exec", target["container"], "rm", "-rf", stage]))
+            commands.append(shlex.join(["rm", "-rf", stage]))
+            subprocess.run(ssh_command(target, " && ".join(commands)), timeout=20)
+
+
 def remote_run_active(target, remote_output):
     """Check /proc inside the target runtime for this exact runner output."""
     script = (
@@ -130,7 +182,9 @@ def remote_run_active(target, remote_output):
 
 def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
                timeout=600, dry_run=False, doctor=False, expected_identity=None,
-               resume=False):
+               source_lock=None, resume=False):
+    if source_lock:
+        validate_source_lock(source_lock)
     output = Path(output).resolve()
     manifest_path = output / "remote-run.json"
     tool_hash = digest({p.name: p.read_text() for p in Path(__file__).parent.glob("*.py")})
@@ -139,7 +193,9 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
         "target": {key: target.get(key) for key in
                    ("host", "container", "python", "cwd", "pythonpath", "setup", "result_root", "env")},
         "device": device, "warmup": warmup, "rounds": rounds, "timeout": timeout,
-        "expected_identity": expected_identity, "tool_hash": tool_hash,
+        "expected_identity": expected_identity,
+        "source_lock": source_lock.get("fingerprint") if source_lock else None,
+        "tool_hash": tool_hash,
     })
     manifest = None
     if not doctor and resume:
@@ -167,12 +223,16 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             argv += ["--pythonpath", path]
         if expected_identity:
             argv += ["--expected-source-fingerprint", expected_identity]
+        if source_lock:
+            argv += ["--source-lock", stage + "/source-lock.json"]
     command = target_command(target, argv, tool_root=stage)
     if dry_run:
         print(json.dumps({"host": target["host"], "container": target.get("container"),
                           "command": command, "download_to": str(output),
                           "note": "No SSH connection or NPU execution performed"}, ensure_ascii=False, indent=2))
         return 0
+    if source_lock:
+        verify_remote(target, source_lock, device=device)
     if not doctor and resume and remote_run_active(target, remote_output):
         raise ValueError(f"Remote run is still active for {remote_output}; wait for it to finish before --resume")
     if not doctor:
@@ -188,10 +248,16 @@ def run_remote(target, cases, output, *, device="npu:0", warmup=10, rounds=100,
             bundle = Path(tmp) / "bundle.tar"
             payload = Path(tmp) / "input.json"
             save_json(payload, cases)
+            lock_file = Path(tmp) / "source-lock.json"
+            if source_lock:
+                validate_source_lock(source_lock)
+                save_json(lock_file, source_lock)
             with tarfile.open(bundle, "w") as tar:
                 for source in sorted(Path(__file__).parent.glob("*.py")):
                     tar.add(source, arcname="kernel_tools/" + source.name)
                 tar.add(payload, arcname="input.json")
+                if source_lock:
+                    tar.add(lock_file, arcname="source-lock.json")
             checked_ssh(target, shlex.join(["mkdir", "-p", stage]))
             staged = True
             with bundle.open("rb") as file:
