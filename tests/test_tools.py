@@ -140,20 +140,28 @@ class SourceLockTest(unittest.TestCase):
         (package / "caller.py").write_text(
             "from .kernel import selected_kernel\ndef launch(x): selected_kernel[(1,)](x)\n")
         (package / "unrelated.py").write_text("VALUE = 1\n")
+        (self.root / ".gitignore").write_text("/vllm_ascend/_build_info.py\n/vllm_ascend/generated/\n")
         subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
         subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "fixture"], check=True)
         self.head = subprocess.check_output(
             ["git", "-C", str(self.root), "rev-parse", "HEAD"], text=True).strip()
+        (package / "_build_info.py").write_text("BUILD = 'generated'\n")
+        (package / "generated").mkdir()
+        (package / "generated/op.py").write_text("# generated op\n")
 
     def tearDown(self):
         self.temp.cleanup()
 
     def test_targeted_context_but_complete_package_lock(self):
+        (self.root / "vllm_ascend/untracked.py").write_text("# intentional local source\n")
         context, packages = local_source(
             self.root / "vllm_ascend/kernel.py", selectors=["selected_kernel"])
         self.assertEqual(set(context), {
             "vllm_ascend/kernel.py", "vllm_ascend/caller.py"})
         self.assertIn("vllm_ascend/unrelated.py", packages["vllm_ascend"]["files"])
+        self.assertIn("vllm_ascend/untracked.py", packages["vllm_ascend"]["files"])
+        self.assertNotIn("vllm_ascend/_build_info.py", packages["vllm_ascend"]["files"])
+        self.assertNotIn("vllm_ascend/generated/op.py", packages["vllm_ascend"]["files"])
         lock = make_source_lock(packages)
         info = {"imports": {"vllm_ascend": str(self.root / "vllm_ascend/__init__.py")},
                 "source_revisions": {"vllm_ascend": {"head": self.head, "dirty": False}}}
@@ -364,10 +372,12 @@ class TransportTest(unittest.TestCase):
             package.mkdir(parents=True)
             (package / "__init__.py").write_text("# fixture\n")
             (package / "kernel.py").write_text("VALUE = 1\n")
+            (source / ".gitignore").write_text("/vllm/_build_info.py\n")
             for args in (("init", "-q"), ("config", "user.email", "test@example.invalid"),
                          ("config", "user.name", "Test"), ("add", "."),
                          ("commit", "-qm", "fixture")):
                 subprocess.run(["git", "-C", str(source), *args], check=True)
+            (package / "_build_info.py").write_text("BUILD = 'generated'\n")
             _, packages = local_source(package)
             lock = make_source_lock(packages)
             target = {"host": "simulated", "cwd": str(source), "python": sys.executable,

@@ -50,12 +50,23 @@ def _worktree_package_files(root, package):
     package_root = root / package
     if not package_root.is_dir():
         return {}
+    result = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "-z", "--cached", "--others",
+         "--exclude-standard", "--", package],
+        capture_output=True,
+        timeout=300,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.decode(errors="replace").strip() or
+                         f"Cannot enumerate Git sources under {package}")
     files = {}
-    for path in sorted(package_root.rglob("*.py")):
-        if path.is_file() and not path.is_symlink() and "__pycache__" not in path.parts:
-            relative = path.relative_to(root).as_posix()
-            if relative not in GENERATED_SOURCE_FILES:
-                files[relative] = path.read_bytes()
+    names = sorted(name.decode(errors="surrogateescape")
+                   for name in result.stdout.split(b"\0") if name)
+    for relative in names:
+        path = root / relative
+        if (relative.endswith(".py") and relative not in GENERATED_SOURCE_FILES and
+                path.is_file() and not path.is_symlink()):
+            files[relative] = path.read_bytes()
     return files
 
 

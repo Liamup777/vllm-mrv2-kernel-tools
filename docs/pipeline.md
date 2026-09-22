@@ -70,7 +70,7 @@ python3 -m kernel_tools generate \
 - 本地解析出的 commit；
 - 指定的 ref；
 - 生成时工作区是否有 Python 源码修改；
-- package 内全部普通 `.py` 文件的 SHA-256。
+- package 内 Git 已跟踪 `.py` 文件以及未被忽略的未跟踪 `.py` 文件的 SHA-256。
 
 单 kernel 的 AI 上下文仍然只有指定文件和定点找到的调用文件；完整 package 哈希只用于版本门禁，不会把全部源码发送给 AI。
 
@@ -85,7 +85,9 @@ python3 -m kernel_tools verify ~/kernel-results/compact-sampling \
 
 1. import 路径位于可识别的 Git checkout；
 2. Git HEAD 与本地 lock 的 commit 相同；
-3. Python 文件没有修改、缺失或新增。
+3. Git 管理范围内的 Python 文件没有修改、缺失或新增。
+
+Git 忽略的构建产物不参与比较，例如 vLLM-Ascend 构建生成的 `_build_info.py` 和 `_cann_ops_custom/`。未被忽略的未跟踪 Python 文件仍会进入 source lock，因此可以验证尚未提交的本地 kernel 修改。
 
 任一项不一致都会报出 package、期望 commit、实际 commit 和文件差异，并停止执行。没有绕过源码校验的选项。`run` 内部始终再次执行相同校验，单独运行 `verify` 只是为了提前检查环境。
 

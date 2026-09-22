@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-kernel-tools"
-version = "0.2.0"
+version = "0.2.1"
 description = "Inspect vLLM Triton release changes and run reproducible Ascend operator cases"
 readme = "README.md"
 requires-python = ">=3.10"

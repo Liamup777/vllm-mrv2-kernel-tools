@@ -37,7 +37,7 @@ python3 -m kernel_tools run ~/kernel-results/generate-029 \
   --npu npu162 --output ~/kernel-results/run-029
 ```
 
-`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 记录 Git commit 和完整 Python 源码哈希。`run` 在启动 case 前核对远端实际 import 路径、commit 和源码哈希，任一不一致都会停止。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
+`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 记录 Git commit、Git 已跟踪的 Python 源码和未被忽略的未跟踪 Python 源码哈希。`run` 在启动 case 前核对远端实际 import 路径、commit 和源码哈希，任一不一致都会停止；`.gitignore` 排除的构建产物不算源码漂移。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 
 如果已经知道要测试的 kernel，可以完全跳过版本扫描：
 
