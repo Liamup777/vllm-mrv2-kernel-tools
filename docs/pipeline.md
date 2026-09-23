@@ -65,14 +65,8 @@ python3 -m kernel_tools generate \
   report.md
 ```
 
-`source-lock.json` 对每个用到的 package 记录：
-
-- 本地解析出的 commit；
-- 指定的 ref；
-- 生成时工作区是否有 Python 源码修改；
-- package 内 Git 已跟踪 `.py` 文件以及未被忽略的未跟踪 `.py` 文件的 SHA-256。
-
-单 kernel 的 AI 上下文仍然只有指定文件和定点找到的调用文件；完整 package 哈希只用于版本门禁，不会把全部源码发送给 AI。
+`source-lock.json` 只记录每个用到的 package（`vllm` / `vllm_ascend`）的 Git commit
+和由这些 commit 算出的短小 fingerprint。单 kernel 的 AI 上下文仍然只包含指定文件和定点找到的调用文件。
 
 可以在运行前单独检查：
 
@@ -84,14 +78,13 @@ python3 -m kernel_tools verify ~/kernel-results/compact-sampling \
 校验读取远端 Python 实际 import 的 `vllm` / `vllm_ascend` 路径，并检查：
 
 1. import 路径位于可识别的 Git checkout；
-2. Git HEAD 与本地 lock 的 commit 相同；
-3. Git 管理范围内的 Python 文件没有修改、缺失或新增。
+2. Git HEAD 与本地 lock 的 commit 相同。
 
-Git 忽略的构建产物不参与比较，例如 vLLM-Ascend 构建生成的 `_build_info.py` 和 `_cann_ops_custom/`。未被忽略的未跟踪 Python 文件仍会进入 source lock，因此可以验证尚未提交的本地 kernel 修改。
+校验不要求远端工作区 clean，也不比较逐文件哈希。独立 `run` 不会自动执行这项校验。
 
-任一项不一致都会报出 package、期望 commit、实际 commit 和文件差异。`pipeline` 会因此停止自动执行；显式 `verify` 只报告检查结果。独立 `run` 不读取 source lock，适合用户已经确认环境后直接运行单个 case。
+commit 不一致时会报出 package、期望 commit 和实际 commit。`pipeline` 会因此停止自动执行；显式 `verify` 只报告检查结果。独立 `run` 不读取 source lock，适合用户已经确认环境后直接运行单个 case。
 
-工具不会 checkout、reset 或修改远端仓库。包 metadata 版本仅作为环境信息，源码身份以实际 import 路径、Git HEAD 和文件哈希为准。
+工具不会 checkout、reset 或修改远端仓库。包 metadata 版本仅作为环境信息，源码身份以实际 import 路径和 Git HEAD 为准。
 
 ## 本地 tag 和额外源码
 

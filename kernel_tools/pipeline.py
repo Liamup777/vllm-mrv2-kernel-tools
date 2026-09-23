@@ -172,10 +172,9 @@ def render_pipeline(root, state, execution_report=""):
                   f"推理强度 `{ai.get('reasoning_effort') or '由 Codex 配置决定'}`；"
                   "release review、逐算子 case 生成和失败分析是独立调用。", ""]
     if state.get("source_packages"):
-        lines += ["源码锁：`" + state.get("source_lock", "") + "`。", ""]
+        lines += ["源码 commit 锁：`" + state.get("source_lock", "") + "`。", ""]
         for name, package in state["source_packages"].items():
             lines += [f"- `{name}`：commit `{package['commit']}`；"
-                      f"Python 文件 {package['file_count']}；"
                       f"生成时源码状态 `{'dirty' if package['dirty'] else 'clean/tag snapshot'}`。"]
         lines.append("")
     review = state.get("review", {})
@@ -194,7 +193,7 @@ def render_pipeline(root, state, execution_report=""):
         lines += [f"数值正确性未检查的场景：{state['correctness_not_checked']}；"
                   "这些场景只证明输入构造、编译和运行状态。", ""]
     logs = sorted((root / "logs").rglob("*.log")) if (root / "logs").exists() else []
-    if logs:
+    if logs and state.get("status") not in {"prepared", "completed", "no_new_operators"}:
         lines += ["## 完整失败日志", "", *[f"- [{p.name}]({p.relative_to(root).as_posix()})" for p in logs], ""]
     (root / "report.md").write_text("\n".join(lines))
     save_json(root / "workflow.json", state)
@@ -394,8 +393,7 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
             source_lock = make_source_lock(package_locks)
             state["source_lock"] = source_lock["fingerprint"]
             state["source_packages"] = {name: {
-                "commit": package["commit"], "dirty": package["dirty"],
-                "file_count": len(package["files"]),
+                "commit": package["commit"], "dirty": package_locks[name]["dirty"],
             } for name, package in source_lock["packages"].items()}
             save_json(root / "source-lock.json", source_lock)
             (workspace / "source").mkdir(exist_ok=True)

@@ -37,7 +37,7 @@ python3 -m kernel_tools run ~/kernel-results/generate-029 \
   --npu npu162 --output ~/kernel-results/run-029
 ```
 
-`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 供 `pipeline` 和显式 `verify` 做源码版本门禁。独立 `run` 只读取所选 case 并执行，不检查 commit、源码哈希或工作区 clean，也不要求 case 旁存在 `source-lock.json`。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
+`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 只记录 `vllm` / `vllm_ascend` commit，供 `pipeline` 和显式 `verify` 做版本门禁。独立 `run` 只读取所选 case 并执行，不检查 commit 或工作区 clean，也不要求 case 旁存在 `source-lock.json`。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 
 如果已经知道要测试的 kernel，可以完全跳过版本扫描：
 
@@ -248,7 +248,7 @@ artifacts/fill-all/
   cases/       # 真正执行的 case，每个算子一份
   results/     # 每个算子的所有场景结果和实际绑定
   logs/        # 仅失败场景的完整日志
-  source-lock.json  # 生成依据的本地 commit 与 Python 源码哈希（generate/pipeline）
+  source-lock.json  # 生成依据的 vllm / vllm-ascend commit（generate/pipeline）
   report.md    # 场景结果、耗时、失败原因与日志链接
 ```
 

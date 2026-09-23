@@ -142,41 +142,52 @@ def package_lock(package, commit, sources, *, ref=None, local_root=None):
 
 
 def make_source_lock(packages):
+    """Build the persisted commit gate used by verify and pipeline.
+
+    ``packages`` may contain file hashes used internally while selecting AI
+    context, but the persisted lock intentionally records only repository
+    commits.  Standalone ``run`` does not consume this lock.
+    """
     if not packages:
         raise ValueError("At least one source package is required")
     normalized = {}
     for name, value in sorted(packages.items()):
         if name not in PACKAGES:
             raise ValueError(f"Unsupported source package: {name}")
-        normalized[name] = {
-            "commit": value["commit"],
-            "requested_ref": value.get("requested_ref"),
-            "dirty": bool(value.get("dirty")),
-            "files": dict(sorted(value["files"].items())),
-        }
-        if value.get("local_root"):
-            normalized[name]["local_root"] = value["local_root"]
-    identity = {"schema_version": 1, "packages": {
-        name: {key: value[key] for key in ("commit", "requested_ref", "dirty", "files")}
-        for name, value in normalized.items()
-    }}
+        commit = value.get("commit")
+        if not isinstance(commit, str) or not commit:
+            raise ValueError(f"Source package {name} has no commit")
+        normalized[name] = {"commit": commit}
+    identity = {"schema_version": 2, "packages": normalized}
     return {**identity, "fingerprint": digest(identity)}
 
 
 def validate_source_lock(lock):
-    if not isinstance(lock, dict) or lock.get("schema_version") != 1:
+    if not isinstance(lock, dict) or lock.get("schema_version") not in {1, 2}:
         raise ValueError("Unsupported source lock format")
     packages = lock.get("packages")
     if not isinstance(packages, dict) or not packages:
         raise ValueError("Source lock has no packages")
-    rebuilt = make_source_lock(packages)
-    if rebuilt["fingerprint"] != lock.get("fingerprint"):
+    if lock["schema_version"] == 1:
+        # Read old artifacts, but all new locks use the compact schema above.
+        identity = {"schema_version": 1, "packages": {}}
+        for name, value in sorted(packages.items()):
+            if name not in PACKAGES:
+                raise ValueError(f"Unsupported source package: {name}")
+            identity["packages"][name] = {
+                key: value[key]
+                for key in ("commit", "requested_ref", "dirty", "files")
+            }
+        fingerprint = digest(identity)
+    else:
+        fingerprint = make_source_lock(packages)["fingerprint"]
+    if fingerprint != lock.get("fingerprint"):
         raise ValueError("Source lock fingerprint is invalid")
     return lock
 
 
 def verify_source_lock(lock, info):
-    """Compare a lock with the sources actually imported by this Python environment."""
+    """Compare locked commits with the actually imported Git checkouts."""
     validate_source_lock(lock)
     mismatches = []
     actual = {}
@@ -185,7 +196,6 @@ def verify_source_lock(lock, info):
         if not origin or not Path(origin).is_file():
             mismatches.append(f"{package}: actual import path is unavailable ({origin!r})")
             continue
-        package_root = Path(origin).resolve().parent
         imported_from = str(Path(origin).resolve())
         revision = info.get("source_revisions", {}).get(package, {})
         head = revision.get("head")
@@ -194,23 +204,9 @@ def verify_source_lock(lock, info):
         elif head != expected["commit"]:
             mismatches.append(f"{package}: expected commit {expected['commit']}, actual {head}; "
                               f"imported from {imported_from}")
-        files = _worktree_package_files(package_root.parent, package)
-        hashes = {name: _hash(data) for name, data in sorted(files.items())}
-        expected_files = expected["files"]
-        changed = sorted(name for name in expected_files.keys() & hashes.keys()
-                         if expected_files[name] != hashes[name])
-        missing = sorted(expected_files.keys() - hashes.keys())
-        extra = sorted(hashes.keys() - expected_files.keys())
-        if changed or missing or extra:
-            examples = [*(f"changed {name}" for name in changed[:5]),
-                        *(f"missing {name}" for name in missing[:5]),
-                        *(f"extra {name}" for name in extra[:5])]
-            mismatches.append(f"{package}: {len(changed)} changed, {len(missing)} missing, "
-                              f"{len(extra)} extra Python files ({'; '.join(examples)}); "
-                              f"imported from {imported_from}")
+        package_root = Path(origin).resolve().parent
         actual[package] = {"import": imported_from, "root": str(package_root.parent),
-                           "commit": head, "dirty": revision.get("dirty"),
-                           "file_count": len(hashes)}
+                           "commit": head, "dirty": revision.get("dirty")}
     if mismatches:
         raise ValueError("Source verification failed: " + " | ".join(mismatches))
     return {"status": "verified", "fingerprint": lock["fingerprint"], "packages": actual}

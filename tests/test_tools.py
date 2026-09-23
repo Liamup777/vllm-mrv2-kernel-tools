@@ -149,7 +149,7 @@ class SourceLockTest(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def test_targeted_context_but_complete_package_lock(self):
+    def test_targeted_context_but_commit_only_persisted_lock(self):
         (self.root / "vllm_ascend/untracked.py").write_text("# intentional local source\n")
         context, packages = local_source(
             self.root / "vllm_ascend/kernel.py", selectors=["selected_kernel"])
@@ -160,12 +160,14 @@ class SourceLockTest(unittest.TestCase):
         self.assertNotIn("vllm_ascend/_build_info.py", packages["vllm_ascend"]["files"])
         self.assertNotIn("vllm_ascend/generated/op.py", packages["vllm_ascend"]["files"])
         lock = make_source_lock(packages)
+        self.assertEqual(lock["schema_version"], 2)
+        self.assertEqual(lock["packages"], {
+            "vllm_ascend": {"commit": self.head}})
         info = {"imports": {"vllm_ascend": str(self.root / "vllm_ascend/__init__.py")},
                 "source_revisions": {"vllm_ascend": {"head": self.head, "dirty": False}}}
         self.assertEqual(verify_source_lock(lock, info)["status"], "verified")
         (self.root / "vllm_ascend/unrelated.py").write_text("VALUE = 2\n")
-        with self.assertRaisesRegex(ValueError, "1 changed"):
-            verify_source_lock(lock, info)
+        self.assertEqual(verify_source_lock(lock, info)["status"], "verified")
 
     def test_ref_reads_committed_source_instead_of_dirty_worktree(self):
         kernel = self.root / "vllm_ascend/kernel.py"
