@@ -84,6 +84,10 @@ class PipelineTest(unittest.TestCase):
     def git(self, *args):
         subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True)
 
+    def rev(self, ref):
+        return subprocess.check_output(
+            ["git", "-C", str(self.repo), "rev-parse", ref], text=True).strip()
+
     def commit(self, tag):
         self.git("add", ".")
         self.git("commit", "-qm", tag)
@@ -115,6 +119,18 @@ class PipelineTest(unittest.TestCase):
                          {"cases", "results", "source-lock.json", "workflow.json", "report.md"})
         lock = json.loads((self.output / "source-lock.json").read_text())
         self.assertEqual(lock["packages"]["vllm"]["commit"], self.state()["delta"]["target"]["commit"])
+
+    def test_pipeline_accepts_commit_ids(self):
+        base = self.rev("v1.0.0^{commit}")
+        target = self.rev("v1.1.0^{commit}")
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pipeline(self.repo, base, target, "test", self.config, self.output,
+                                      ai_client=self.ai, prepare_only=True), 0)
+        state = self.state()
+        self.assertEqual(state["delta"]["base"]["ref_type"], "commit")
+        self.assertEqual(state["delta"]["target"]["ref_type"], "commit")
+        self.assertEqual(state["delta"]["base"]["commit"], base)
+        self.assertEqual(state["delta"]["target"]["commit"], target)
 
     def test_missing_candidate_blocks_before_remote_run(self):
         self.ai.omit = True
@@ -350,6 +366,17 @@ class ReviewCommandTest(unittest.TestCase):
         report = json.loads((f.output / "review.json").read_text())
         self.assertEqual(report["status"], "reviewed")
         self.assertEqual(len(report["resumes"]), 1)
+
+    def test_scan_resume_rejects_ref_that_resolves_to_another_commit(self):
+        from kernel_tools.review import scan_with_ai
+        f = self.fixture
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(scan_with_ai(f.repo, "v1.0.0", "v1.1.0", f.output,
+                                          ai_client=f.ai), 0)
+        f.git("tag", "-f", "v1.1.0", "v1.0.0")
+        with self.assertRaisesRegex(ValueError, "target commit"):
+            scan_with_ai(f.repo, "v1.0.0", "v1.1.0", f.output,
+                         ai_client=f.ai, resume=True)
 
     def test_cli_scan_routes_to_ai(self):
         from kernel_tools.cli import main

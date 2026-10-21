@@ -9,6 +9,7 @@ import ast
 import collections
 import copy
 import hashlib
+import re
 import subprocess
 import tarfile
 import tempfile
@@ -38,11 +39,24 @@ def node_hash(node, ignore_name=False):
     return hashlib.sha256(ast.dump(value, include_attributes=False).encode()).hexdigest()
 
 
-def tagged_sources(repo, tag):
-    # Always resolve refs/tags explicitly; a same-named branch is not equivalent.
-    if tag.startswith("-") or ":" in tag or ".." in tag or "^" in tag or "~" in tag:
-        raise ValueError("Expected a literal Git tag")
-    commit = git(repo, "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}")
+def resolve_revision(repo, ref):
+    """Resolve an exact tag or hexadecimal commit ID without revision expressions."""
+    if (not isinstance(ref, str) or not ref or ref.startswith("-") or
+            any(char.isspace() for char in ref) or any(token in ref for token in (":", "..", "^", "~", "@{"))):
+        raise ValueError("Expected a literal Git tag or 7-40 character commit ID")
+    try:
+        return git(repo, "rev-parse", "--verify", f"refs/tags/{ref}^{{commit}}"), "tag"
+    except ValueError as tag_error:
+        if not re.fullmatch(r"[0-9a-fA-F]{7,40}", ref):
+            raise ValueError(f"Git tag not found: {ref}") from tag_error
+        try:
+            return git(repo, "rev-parse", "--verify", f"{ref}^{{commit}}"), "commit"
+        except ValueError as commit_error:
+            raise ValueError(f"Git commit not found or ambiguous: {ref}") from commit_error
+
+
+def revision_sources(repo, ref):
+    commit, ref_type = resolve_revision(repo, ref)
     with tempfile.TemporaryFile() as archive:
         process = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", commit, "vllm"],
                                  stdout=archive, stderr=subprocess.PIPE)
@@ -52,6 +66,12 @@ def tagged_sources(repo, tag):
         with tarfile.open(fileobj=archive, mode="r|") as tar:
             files = {m.name: tar.extractfile(m).read().decode("utf-8")
                      for m in tar if m.isfile() and m.name.endswith(".py")}
+    return commit, files, ref_type
+
+
+def tagged_sources(repo, tag):
+    """Backward-compatible two-value API; ``tag`` may now also be a commit ID."""
+    commit, files, _ = revision_sources(repo, tag)
     return commit, files
 
 
@@ -131,7 +151,7 @@ class Module:
 
 def scan(repo, tag, scope="vllm/v1/worker/gpu"):
     repo = Path(repo).resolve()
-    commit, sources = tagged_sources(repo, tag)
+    commit, sources, ref_type = revision_sources(repo, tag)
     scope = scope.strip("/")
     if not any(p.startswith(scope + "/") for p in sources):
         raise ValueError(f"Scope {scope} does not exist at {tag}")
@@ -250,7 +270,8 @@ def scan(repo, tag, scope="vllm/v1/worker/gpu"):
                   "reason": "no statically resolved direct launch found; helper or dynamic launch needs review"}
                  for name, (module, info) in functions.items()
                  if info["jit"] and module.path.startswith(scope + "/") and name not in launched_anywhere]
-    return {"schema_version": 1, "tag": tag, "commit": commit, "scope": scope,
+    return {"schema_version": 1, "ref": tag, "ref_type": ref_type,
+            "tag": tag, "commit": commit, "scope": scope,
             "validation": "static_candidates_only", "complete_inventory": False,
             "limitations": ["Dynamic dispatch, monkey patches and conditional runtime binding require review.",
                             "All functions under scope are static roots, not proof of runtime reachability.",
@@ -281,8 +302,13 @@ def compare(before, after):
                    if old[name][key] != new[name][key]]
         if changes:
             changed.append({"id": name, "changes": changes})
-    return {"schema_version": 1, "base": {"tag": before["tag"], "commit": before["commit"]},
-            "target": {"tag": after["tag"], "commit": after["commit"]},
+    return {"schema_version": 1,
+            "base": {"ref": before.get("ref", before["tag"]),
+                     "ref_type": before.get("ref_type", "tag"),
+                     "tag": before["tag"], "commit": before["commit"]},
+            "target": {"ref": after.get("ref", after["tag"]),
+                       "ref_type": after.get("ref_type", "tag"),
+                       "tag": after["tag"], "commit": after["commit"]},
             "validation": "static_candidates_only", "added": sorted(added), "removed": sorted(removed),
             "moved_or_renamed": moves, "changed": changed,
             "requires_review": bool(after["unresolved_launches"] or after["parse_errors"] or after["unlaunched_jit"])}

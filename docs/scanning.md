@@ -6,11 +6,13 @@ python3 -m kernel_tools scan --repo ../vllm \
   --output ~/vllm-kernel-tools-output/scan-029-ai
 ```
 
+`--base` 和 `--target` 接受本地 Git tag 或 7–40 位十六进制 commit SHA。建议自动化任务使用完整的 40 位 SHA；工具不会自动 fetch，指定对象必须已经存在于本地仓库。
+
 需要已登录且可用的 Codex CLI；默认使用本机模型配置，可通过 `--model` 指定。`--config` 默认读取 kernel-tools.json 的 ai.codex；配置文件不存在时使用 PATH 中的 codex。scan 不需要 NPU 配置，不连接服务器，也不生成 case。
 
 ## 内部流程
 
-1. 固定代码读取两个明确的 Git tag，提取只读源码快照，不切换用户分支。
+1. 固定代码读取两个明确的 Git tag 或 commit，提取只读源码快照，不切换用户分支。
 2. 固定 AST 程序提供定义、启动点、调用关系和变化的候选线索；这些线索可能遗漏或误报。
 3. 通过 codex exec 调用 AI，传入 release-scan skill 和源码快照。AI 独立复核新增、改名、helper，以及被 GPU 目录模块显式 import 并直接 launch 的外部 Triton kernel。
 4. 固定代码检查返回结构及新增定义是否存在，生成 review.md 和 review.json。内部快照和成功调用日志随临时目录清理；失败保留完整日志。

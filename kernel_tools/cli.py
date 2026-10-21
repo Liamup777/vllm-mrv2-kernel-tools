@@ -66,10 +66,10 @@ def parser():
     verify.add_argument("--config", type=Path, default=Path("kernel-tools.json"))
     verify.add_argument("--device")
     verify.add_argument("--dry-run", action="store_true")
-    scan = sub.add_parser("scan", help="调用 AI 和 release-scan skill，核实两个 tag 之间的新增算子")
+    scan = sub.add_parser("scan", help="调用 AI 和 release-scan skill，核实两个 Git ref 之间的新增算子")
     scan.add_argument("--repo", type=Path, required=True)
-    scan.add_argument("--base", required=True)
-    scan.add_argument("--target", required=True)
+    scan.add_argument("--base", required=True, help="基线 vLLM tag 或 7-40 位 commit SHA")
+    scan.add_argument("--target", required=True, help="待测 vLLM tag 或 7-40 位 commit SHA")
     scan.add_argument("--scope", default="vllm/v1/worker/gpu")
     scan.add_argument("--output", type=Path, help="默认写入用户数据目录，不写入工具仓库")
     scan.add_argument("--config", type=Path, default=Path("kernel-tools.json"), help="可选；仅读取 ai 配置，不需要 NPU 配置")
@@ -99,8 +99,8 @@ def parser():
     generate.add_argument("--dry-run", action="store_true", help="只显示计划，不调用 AI、不连接远端")
     flow = sub.add_parser("pipeline", help="扫描新增算子 → 调用 AI 生成用例 → NPU 执行与报告")
     flow.add_argument("--repo", type=Path, required=True)
-    flow.add_argument("--base", required=True, help="基线 vLLM tag")
-    flow.add_argument("--target", required=True, help="待测 vLLM tag")
+    flow.add_argument("--base", required=True, help="基线 vLLM tag 或 7-40 位 commit SHA")
+    flow.add_argument("--target", required=True, help="待测 vLLM tag 或 7-40 位 commit SHA")
     flow.add_argument("--npu", required=True, help="kernel-tools.json 中的远端目标，如 npu165")
     flow.add_argument("--source", type=Path, action="append", default=[],
                       help="生成 case 时额外读取的本地源码仓库或目录；可重复")
@@ -242,7 +242,7 @@ def main(argv=None):
                 if not args.repo:
                     raise ValueError("generate --scan requires --repo")
                 if args.ref:
-                    raise ValueError("generate --scan already uses its target tag; --ref is only for --kernel")
+                    raise ValueError("generate --scan already uses its target ref; --ref is only for --kernel")
                 return generate_from_scan(args.scan, args.repo, output, sources=args.source,
                                           config=args.config, **common)
             if args.repo:

@@ -10,7 +10,7 @@ from pathlib import Path
 
 from .ai import REVIEW_SCHEMA, Codex, resolve_codex
 from .common import save_json
-from .scan import Module, tagged_sources, write_scan
+from .scan import Module, resolve_revision, tagged_sources, write_scan
 
 
 REVIEW_POLICY_VERSION = 3
@@ -35,8 +35,13 @@ def instructions(skill, task):
             f"Apply this skill:\n{body}\n\nTask:\n{task}")
 
 
-def write_sources(repo, tag, destination):
-    commit, files = tagged_sources(repo, tag)
+def revision_ref(identity):
+    """Read new ref identities while remaining compatible with tag-only artifacts."""
+    return identity.get("ref") or identity.get("tag")
+
+
+def write_sources(repo, ref, destination):
+    commit, files = tagged_sources(repo, ref)
     for name, content in files.items():
         path = destination / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,13 +62,14 @@ def load_scan_result(path):
         raise ValueError("Scan result uses an incompatible review policy; run scan again")
     for side in ("base", "target"):
         value = document.get(side)
-        if not isinstance(value, dict) or not all(value.get(k) for k in ("tag", "commit")):
-            raise ValueError(f"Scan result lacks {side} tag/commit identity")
+        if (not isinstance(value, dict) or not revision_ref(value) or
+                not value.get("commit")):
+            raise ValueError(f"Scan result lacks {side} ref/commit identity")
     return file, document
 
 
 def resolve_target_definition(identity, target_sources):
-    """Resolve an AI-returned identity against authoritative target-tag ASTs."""
+    """Resolve an AI-returned identity against authoritative target-ref ASTs."""
     parts = identity.split(".")
     for end in range(len(parts) - 1, 0, -1):
         module = ".".join(parts[:end])
@@ -98,7 +104,7 @@ def validate_review(review, delta, target_sources, before):
             if identity in known or identity in moved:
                 raise ValueError(f"AI called an existing/moved operator new: {identity}")
             if definition is None:
-                raise ValueError(f"AI new operator is not a target-tag Triton JIT definition: {identity}")
+                raise ValueError(f"AI new operator is not a target-ref Triton JIT definition: {identity}")
     if required - seen:
         raise ValueError("AI silently omitted candidates: " + ", ".join(sorted(required - seen)))
 
@@ -123,7 +129,7 @@ def review_sources(ai, delta, target_sources, before, workspace, failure_log):
         "Account for EVERY delta.added and moved_or_renamed target with new/not_new/needs_review. "
         "Add missed operators only when they meet the local-definition or explicit-import boundary. "
         "For each operator, id is the fully qualified Python function. The controller resolves definition and kernel "
-        "from the target-tag AST; do not return those redundant fields. Evidence must cite the definition and direct "
+        "from the target-ref AST; do not return those redundant fields. Evidence must cite the definition and direct "
         "launch path:line, wrapper/call path and activation condition; compare against base to explain "
         "whether it is truly new. Ordinary list[T]()/set[T](), generic containers, dispatch tables and "
         "unlaunched helpers must not be counted as Triton launches. Changes only in a shared module "
@@ -151,7 +157,7 @@ def review_sources(ai, delta, target_sources, before, workspace, failure_log):
 
 def render_review(root, document):
     review = document.get("review", {})
-    lines = [f"# 新增 Triton 算子：{document['base']['tag']} → {document['target']['tag']}", "",
+    lines = [f"# 新增 Triton 算子：{revision_ref(document['base'])} → {revision_ref(document['target'])}", "",
              "本报告由 Codex 按 vllm-triton-release-scan skill 复核源码生成；不是 NPU 测试结果。", "",
              f"状态：`{document['status']}`；范围：`{document['scope']}`。", "",
              f"基线 commit：`{document['base']['commit']}`；目标 commit：`{document['target']['commit']}`。", ""]
@@ -187,10 +193,14 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
             raise ValueError(f"Cannot resume without {existing}")
         document = json.loads(existing.read_text())
         expected = {"base": base, "target": target, "scope": scope}
-        actual = {"base": document.get("base", {}).get("tag"),
-                  "target": document.get("target", {}).get("tag"),
+        actual = {"base": revision_ref(document.get("base", {})),
+                  "target": revision_ref(document.get("target", {})),
                   "scope": document.get("scope")}
         mismatch = [key for key in expected if expected[key] != actual[key]]
+        for side, ref in (("base", base), ("target", target)):
+            stored_commit = document.get(side, {}).get("commit")
+            if stored_commit and resolve_revision(repo, ref)[0] != stored_commit:
+                mismatch.append(side + " commit")
         if mismatch:
             raise ValueError("Resume arguments differ from review.json: " + ", ".join(mismatch))
         if (document.get("status") in {"reviewed", "needs_review"} and
@@ -208,7 +218,8 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
         raise ValueError(f"Scan output already exists: {root}; choose a new directory")
     else:
         document = {"schema_version": 1, "status": "running", "scope": scope,
-                    "base": {"tag": base, "commit": None}, "target": {"tag": target, "commit": None},
+                    "base": {"ref": base, "tag": base, "commit": None},
+                    "target": {"ref": target, "tag": target, "commit": None},
                     "validation": "ai_source_review", "complete_inventory": False,
                     "runtime_coverage": "not_checked", "review_policy_version": REVIEW_POLICY_VERSION,
                     "model": model or "Codex configured default",
@@ -219,7 +230,7 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
         ai = ai_client or Codex(resolve_codex(config, codex), model, ai_timeout, reasoning_effort)
         with tempfile.TemporaryDirectory(prefix="kernel-tools-review-") as tmp:
             workspace = Path(tmp)
-            print("[scan] Preparing exact tag sources and candidate hints", flush=True)
+            print("[scan] Preparing exact Git ref sources and candidate hints", flush=True)
             delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
             before = json.loads((workspace / "scan/base.json").read_text())
             write_sources(repo, base, workspace / "base")

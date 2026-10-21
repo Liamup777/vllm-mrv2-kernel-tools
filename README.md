@@ -6,7 +6,7 @@
 - `scan`、`generate`、`run` 也可分别执行；每一步直接消费上一步的持久化产物。
 - 使用 JSON/JSONL case 直接执行 `kernel[grid](...)`，只测 Triton kernel 本体。
 - 一条命令按算子或 case 筛选、运行、汇总；失败保存完整日志。
-- 从指定 Git tag 扫描静态候选并比较版本，不切换被测仓库的分支。
+- 从指定 Git tag 或 commit 扫描静态候选并比较源码，不切换被测仓库的分支。
 - 控制端只需 Python 3.10+；NPU 执行端使用已有 Torch / torch_npu / Triton / CANN 环境。
 
 ## 完整流程（推荐入口）
@@ -36,6 +36,16 @@ python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
 python3 -m kernel_tools run ~/kernel-results/generate-029 \
   --npu npu162 --output ~/kernel-results/run-029
 ```
+
+`scan` 和 `pipeline` 的 `--base`、`--target` 均可使用本地 tag，或 7–40 位十六进制 commit SHA。例如：
+
+```bash
+python3 -m kernel_tools scan --repo ../vllm \
+  --base db9527a46873 --target ced6857afa0ea7b2e3f0846a62e1394e90f15607 \
+  --output ~/kernel-results/scan-by-commit
+```
+
+commit 必须已存在于本地仓库。工具通过 Git object 读取源码，不 checkout 或修改当前工作区；建议在可复现流程中使用完整的 40 位 SHA。
 
 `generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 只记录 `vllm` / `vllm_ascend` commit，供 `pipeline` 和显式 `verify` 做版本门禁。独立 `run` 只读取所选 case 并执行，不检查 commit 或工作区 clean，也不要求 case 旁存在 `source-lock.json`。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
 

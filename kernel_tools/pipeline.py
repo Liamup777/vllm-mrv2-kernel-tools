@@ -18,7 +18,7 @@ from .common import file_key, save_json
 from .remote import load_target, run_remote
 from .scan import Module, write_scan
 from .review import (REVIEW_POLICY_VERSION, instructions, load_scan_result,
-                     resource_root, review_sources, write_sources)
+                     resource_root, review_sources, revision_ref, write_sources)
 from .source_lock import local_source, make_source_lock, package_lock
 
 
@@ -144,7 +144,7 @@ def render_pipeline(root, state, execution_report=""):
     def safe(value):
         return str(value).replace("|", "\\|").replace("\n", " ")
     version = ("源码：本地选择的 `vllm` / `vllm_ascend`" if state.get("selection_mode") == "manual"
-               else f"版本：`{state['base']}` → `{state['target']}`")
+               else f"Git ref：`{state['base']}` → `{state['target']}`")
     target = f"；NPU 目标：`{state['npu']}`" if state.get("npu") else ""
     lines = ["# Triton 单算子测试报告", "",
              f"{version}{target}。", "",
@@ -156,7 +156,7 @@ def render_pipeline(root, state, execution_report=""):
     if state.get("source_drift"):
         drift = state["source_drift"]
         if isinstance(drift, dict):
-            lines += ["运行源码与目标 tag 存在差异："
+            lines += ["运行源码与目标 ref 存在差异："
                       f"修改 {drift['changed_count']}、远端缺少 {drift['missing_count']}、"
                       f"远端新增 {drift['extra_count']} 个 Python 文件。", "",
                       f"远端 vLLM 包版本：`{drift.get('remote_package_version')}`；"
@@ -164,7 +164,7 @@ def render_pipeline(root, state, execution_report=""):
                       f"目标 commit：`{drift.get('target_commit')}`。", "",
                       "差异示例：" + ", ".join(f"`{p}`" for p in drift["examples"]), ""]
         else:
-            lines += ["运行源码与目标 tag 存在差异：" + drift, ""]
+            lines += ["运行源码与目标 ref 存在差异：" + drift, ""]
     if state.get("ai"):
         ai = state["ai"]
         lines += ["AI："
@@ -175,7 +175,7 @@ def render_pipeline(root, state, execution_report=""):
         lines += ["源码 commit 锁：`" + state.get("source_lock", "") + "`。", ""]
         for name, package in state["source_packages"].items():
             lines += [f"- `{name}`：commit `{package['commit']}`；"
-                      f"生成时源码状态 `{'dirty' if package['dirty'] else 'clean/tag snapshot'}`。"]
+                      f"生成时源码状态 `{'dirty' if package['dirty'] else 'clean/ref snapshot'}`。"]
         lines.append("")
     review = state.get("review", {})
     if review:
@@ -330,8 +330,8 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 incomplete = False
                 commit = None
             else:
-                stage("Verify scan result against exact tag sources" if operation == "generate"
-                      else "Static scan and exact tag source extraction",
+                stage("Verify scan result against exact Git ref sources" if operation == "generate"
+                      else "Static scan and exact Git ref source extraction",
                       "1/3" if operation == "generate" else "1/6")
                 delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
                 state["delta"] = delta
@@ -341,9 +341,9 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 if scan_input:
                     scan_file, scan_document = load_scan_result(scan_input)
                     expected_scan = {
-                        "base tag": (scan_document["base"]["tag"], base),
+                        "base ref": (revision_ref(scan_document["base"]), base),
                         "base commit": (scan_document["base"]["commit"], delta["base"]["commit"]),
-                        "target tag": (scan_document["target"]["tag"], target),
+                        "target ref": (revision_ref(scan_document["target"]), target),
                         "target commit": (scan_document["target"]["commit"], delta["target"]["commit"]),
                         "scope": (scan_document.get("scope"), scope),
                     }
@@ -382,7 +382,7 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 extra_sources, extra_locks, local_roots = _add_local_sources(source_paths)
                 for name, source in extra_sources.items():
                     if name in runtime_sources and runtime_sources[name] != source:
-                        raise ValueError(f"Local --source conflicts with target-tag source: {name}")
+                        raise ValueError(f"Local --source conflicts with target-ref source: {name}")
                     runtime_sources[name] = source
                 for package, identity in extra_locks.items():
                     if package in package_locks and package_locks[package]["files"] != identity["files"]:
@@ -442,7 +442,7 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                 source_guidance = (
                     "Read source/ as the authoritative selected LOCAL sources. "
                     if selected_kernels else
-                    "Read target/ for exact upstream target-tag sources and source/ for additional LOCAL binding sources. "
+                    "Read target/ for exact upstream target-ref sources and source/ for additional LOCAL binding sources. "
                 )
                 task = ("Generate multi-scenario cases for this operator:\n" + json.dumps(operator, ensure_ascii=False)
                     + "\n" + source_guidance +
@@ -570,7 +570,7 @@ def pipeline(repo, base, target, npu, config, output, **kwargs):
 def generate_from_scan(scan_input, repo, output, *, sources=(), config=None, **kwargs):
     """Generate reusable direct-Triton cases from a completed scan artifact."""
     _, document = load_scan_result(scan_input)
-    return _execute_workflow(repo, document["base"]["tag"], document["target"]["tag"],
+    return _execute_workflow(repo, revision_ref(document["base"]), revision_ref(document["target"]),
                              None, config, output, scope=document["scope"], source_paths=sources,
                              prepare_only=True, scan_input=scan_input,
                              operation="generate", **kwargs)

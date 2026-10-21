@@ -28,6 +28,8 @@ python3 -m kernel_tools pipeline --repo ../vllm \
 
 pipeline 的扫描和生成阶段仍在本机完成，直到源码校验和执行阶段才连接 `--npu`。流程按需运行，不包含周期调度。
 
+`scan` 和 `pipeline` 的 `--base`、`--target` 可分别使用本地 tag 或 7–40 位十六进制 commit SHA。commit 必须已经存在于本地仓库，推荐使用完整的 40 位 SHA。两端可以混用，例如以发布 tag 为基线、以待合入 commit 为目标。
+
 ## 指定单个 kernel
 
 已知 kernel 时可以跳过 release scan：
@@ -86,17 +88,17 @@ commit 不一致时会报出 package、期望 commit 和实际 commit。`pipelin
 
 工具不会 checkout、reset 或修改远端仓库。包 metadata 版本仅作为环境信息，源码身份以实际 import 路径和 Git HEAD 为准。
 
-## 本地 tag 和额外源码
+## 本地 Git ref 和额外源码
 
-release scan 的 `--base`、`--target` 只要求存在于本机 `--repo`。扫描器通过 Git object 读取两个 tag，不切换当前分支。
+release scan 的 `--base`、`--target` 只接受本机 `--repo` 中存在的明确 tag 或 commit SHA。扫描器通过 Git object 读取两个 ref，不切换当前分支，也不接受分支名或 `HEAD~1` 等 revision 表达式。
 
-`generate --scan` 会再次核对 scan 产物中的 tag、commit、范围和 AST 证据。目标 vLLM 源码固定来自 scan 对应的 target tag；额外的本地 `--source` 通常指向 vLLM-Ascend，用于分析实际 Ascend binding。两者都会进入同一个 source lock，远端必须同时匹配。
+`generate --scan` 会再次核对 scan 产物中的 ref、解析后的 commit、范围和 AST 证据。目标 vLLM 源码固定来自 scan 对应的 target ref；额外的本地 `--source` 通常指向 vLLM-Ascend，用于分析实际 Ascend binding。两者都会进入同一个 source lock，远端必须同时匹配。
 
 ## AI 和固定代码的边界
 
 | 阶段 | 执行者 | 行为 |
 |---|---|---|
-| tag 差异和静态候选 | Python/Git | 读取本地精确 tag，用 AST 找直接 launch、调用关系和源码变化 |
+| Git ref 差异和静态候选 | Python/Git | 读取本地精确 tag/commit，用 AST 找直接 launch、调用关系和源码变化 |
 | 新增算子复核 | Codex + release skill | 核实新增、改名、helper、显式 import 和启动条件 |
 | 定点源码收集 | Python/Git | 根据 `--source` 和 kernel 名构造受限本地上下文 |
 | case 生成 | Codex + case skill | 从本地上下文分析输入契约，返回直接 Triton JSON case |
@@ -112,7 +114,7 @@ release scan 的 `--base`、`--target` 只要求存在于本机 `--repo`。扫�
 
 scan、generate、run 和 pipeline 都支持 `--resume`。恢复时：
 
-- scan 复用已完成的 release review；
+- scan 仅在输入 ref 仍解析到原 commit 时复用已完成的 release review；
 - generate 复用 source lock 相同的已生成 case；
 - run 每次重新核对远端源码；
 - 远端已有活动进程时拒绝重复启动；

@@ -344,6 +344,23 @@ def launch(x): external[(1,)](x)
         self.assertEqual(external["launches"][0]["call_path"],
                          ["vllm.v1.worker.gpu.sample.caller", "vllm.ops.outer.launch"])
 
+    def test_scan_accepts_full_and_abbreviated_commit_ids(self):
+        commit = self.git("rev-parse", "v1.0.0^{commit}")
+        for ref in (commit, commit[:12]):
+            with self.subTest(ref=ref):
+                result = scan(self.root, ref)
+                self.assertEqual(result["commit"], commit)
+                self.assertEqual(result["ref"], ref)
+                self.assertEqual(result["ref_type"], "commit")
+                self.assertEqual(result["tag"], ref)
+
+    def test_scan_rejects_branches_and_revision_expressions(self):
+        self.git("branch", "moving")
+        with self.assertRaisesRegex(ValueError, "Git tag not found"):
+            scan(self.root, "moving")
+        with self.assertRaisesRegex(ValueError, "literal Git tag"):
+            scan(self.root, "v1.0.0~1")
+
     def test_helper_change_retests_callers_and_uses_tag_not_branch(self):
         base = scan(self.root, "v1.0.0")
         file = self.root / "vllm/v1/worker/gpu/sample.py"
