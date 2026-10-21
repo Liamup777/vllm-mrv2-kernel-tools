@@ -12,7 +12,7 @@ python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
   --output ~/kernel-results/generate-029
 
 python3 -m kernel_tools run ~/kernel-results/generate-029 \
-  --npu npu162 --output ~/kernel-results/run-029
+  --npu my-npu --output ~/kernel-results/run-029
 ```
 
 `scan` 和 `generate` 只读取本地源码。`generate` 不需要 NPU 配置，也不连接 SSH。独立 `run` 只运行输入 case，不检查源码版本或工作区状态；需要检查时先显式执行 `verify`。`pipeline` 在自动远端执行前使用生成目录中的 `source-lock.json` 做版本门禁。三个输出目录互相独立，每一步都可使用原 `--output` 加 `--resume` 继续。
@@ -23,10 +23,20 @@ python3 -m kernel_tools run ~/kernel-results/generate-029 \
 python3 -m kernel_tools pipeline --repo ../vllm \
   --source ../vllm-ascend \
   --base v0.28.0 --target v0.29.0 \
-  --npu npu162 --output ~/kernel-results/run-029
+  --npu my-npu --output ~/kernel-results/run-029
 ```
 
 pipeline 的扫描和生成阶段仍在本机完成，直到源码校验和执行阶段才连接 `--npu`。流程按需运行，不包含周期调度。
+
+只准备不执行时，无需 NPU 配置或 `--npu`：
+
+```bash
+python3 -m kernel_tools pipeline --repo ../vllm \
+  --source ../vllm-ascend --base v0.28.0 --target v0.29.0 \
+  --prepare-only --output ~/kernel-results/prepared-029
+```
+
+此模式仍会调用 AI；加 `--dry-run` 才只显示计划。准备完成后可显式 `verify` 再 `run`。完整执行缺少 `--npu` 时会在 AI 调用之前报错。
 
 `scan` 和 `pipeline` 的 `--base`、`--target` 可分别使用本地 tag 或 7–40 位十六进制 commit SHA。commit 必须已经存在于本地仓库，推荐使用完整的 40 位 SHA。两端可以混用，例如以发布 tag 为基线、以待合入 commit 为目标。
 
@@ -74,7 +84,7 @@ python3 -m kernel_tools generate \
 
 ```bash
 python3 -m kernel_tools verify ~/kernel-results/compact-sampling \
-  --npu npu160
+  --npu my-npu
 ```
 
 校验读取远端 Python 实际 import 的 `vllm` / `vllm_ascend` 路径，并检查：
@@ -102,8 +112,8 @@ release scan 的 `--base`、`--target` 只接受本机 `--repo` 中存在的明�
 | 新增算子复核 | Codex + release skill | 核实新增、改名、helper、显式 import 和启动条件 |
 | 定点源码收集 | Python/Git | 根据 `--source` 和 kernel 名构造受限本地上下文 |
 | case 生成 | Codex + case skill | 从本地上下文分析输入契约，返回直接 Triton JSON case |
-| source lock | Python/Git | 记录本地 commit 和 package Python 文件哈希 |
-| 远端校验及执行 | Python/SSH | 核对实际 import/HEAD/哈希后上传工具和 case，逐 case 运行 |
+| source lock | Python/Git | 记录 package commit 及由 commit 计算的 fingerprint，不记录文件哈希 |
+| 远端校验及执行 | Python/SSH | pipeline / verify 核对实际 import/HEAD；独立 run 不校验源码。上传工具和 case 后逐 case 运行 |
 | 失败分析 | Codex + remote benchmark skill | 只在运行失败后读取结果、失败日志和已提供源码证据 |
 
 程序调用 `codex exec --sandbox read-only --output-schema ... --output-last-message ...`。release review、每个 kernel 的 case 生成和失败分析是独立调用。AI 返回 JSON 后由固定代码校验，不把模型文字当作 shell 命令执行。
@@ -116,9 +126,9 @@ scan、generate、run 和 pipeline 都支持 `--resume`。恢复时：
 
 - scan 仅在输入 ref 仍解析到原 commit 时复用已完成的 release review；
 - generate 复用 source lock 相同的已生成 case；
-- run 每次重新核对远端源码；
-- 远端已有活动进程时拒绝重复启动；
-- case、source lock、目标配置、工具代码或测量参数变化时拒绝复用旧结果。
+- pipeline 在复用 AI 结果前核对 base/target 仍解析到原 commit，并在远端执行前校验 source lock；
+- 独立远端 run 恢复时检查已有活动进程，拒绝重复启动；pipeline 恢复可能新建执行目录，重试前也应人工确认旧作业状态；
+- 独立 run 不核对源码或 source lock；会校验 case、目标配置、工具代码和测量参数等运行身份。源码变化须自行重新 verify 并使用新输出目录。
 
 `--cases-output` 可把 case 放到独立目录。工具会同时放置对应的 `source-lock.json`，因此该目录可直接传给 `verify`；`run` 可以直接使用目录中的 case，也可以只使用其中一个 case 文件。
 

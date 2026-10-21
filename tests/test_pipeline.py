@@ -154,6 +154,46 @@ class PipelineTest(unittest.TestCase):
             remote.assert_not_called()
         self.assertEqual(self.state()["status"], "prepared")
 
+    def test_prepare_only_cli_without_target_or_config(self):
+        from kernel_tools.cli import main
+        missing_config = self.root / "does-not-exist.json"
+        with patch("kernel_tools.pipeline.Codex", return_value=self.ai), \
+                patch("kernel_tools.pipeline.load_target") as load_target, \
+                patch("kernel_tools.pipeline.run_remote") as remote, \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = main(["pipeline", "--repo", str(self.repo), "--base", "v1.0.0",
+                         "--target", "v1.1.0", "--config", str(missing_config),
+                         "--output", str(self.output), "--prepare-only"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self.state()["status"], "prepared")
+        self.assertIsNone(self.state()["npu"])
+        self.assertEqual(len(self.ai.calls), 2)
+        self.assertTrue((self.output / "source-lock.json").is_file())
+        load_target.assert_not_called()
+        remote.assert_not_called()
+
+    def test_execution_without_target_fails_before_ai(self):
+        from kernel_tools.cli import main
+        errors = io.StringIO()
+        with patch("kernel_tools.pipeline.Codex") as ai, \
+                contextlib.redirect_stderr(errors):
+            code = main(["pipeline", "--repo", str(self.repo), "--base", "v1.0.0",
+                         "--target", "v1.1.0", "--output", str(self.output)])
+        self.assertEqual(code, 2)
+        self.assertIn("requires --npu", errors.getvalue())
+        ai.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_pipeline_resume_rejects_moved_tag_before_reusing_ai(self):
+        self.assertEqual(self.run_flow(prepare_only=True), 0)
+        calls = len(self.ai.calls)
+        self.git("tag", "-f", "v1.0.0", "v1.1.0")
+        with patch("kernel_tools.pipeline.run_remote") as remote:
+            self.assertEqual(self.run_flow(prepare_only=True, resume=True), 1)
+        self.assertIn("Resume base commit changed", self.state()["error"])
+        self.assertEqual(len(self.ai.calls), calls)
+        remote.assert_not_called()
+
     def test_resume_reuses_review_and_generated_cases(self):
         with patch("kernel_tools.pipeline.run_remote") as remote:
             self.assertEqual(self.run_flow(prepare_only=True), 0)

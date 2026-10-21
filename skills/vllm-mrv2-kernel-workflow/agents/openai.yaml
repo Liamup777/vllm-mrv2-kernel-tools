@@ -1,0 +1,4 @@
+interface:
+  display_name: "MRV2 Kernel Workflow"
+  short_description: "Scan commits, prepare kernel cases and run on Ascend"
+  default_prompt: "Use $vllm-mrv2-kernel-workflow to scan these vLLM commits, prepare kernel cases, and run the requested stages with my environment configuration."

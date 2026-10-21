@@ -7,7 +7,7 @@ name = "vllm-kernel-tools"
 version = "0.2.2"
 description = "Inspect vLLM Triton release changes and run reproducible Ascend operator cases"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = {text = "Apache-2.0"}
 dependencies = []
 
@@ -18,8 +18,12 @@ kernel-tools = "kernel_tools.cli:main"
 include = ["kernel_tools*"]
 
 [tool.setuptools.data-files]
-"share/vllm-kernel-tools" = ["README.md"]
+"share/vllm-kernel-tools" = ["README.md", "NOTICE", "kernel-tools.example.json"]
+"share/vllm-kernel-tools/examples" = ["examples/*.json"]
 "share/vllm-kernel-tools/docs" = ["docs/cases.md", "docs/scanning.md", "docs/pipeline.md"]
 "share/vllm-kernel-tools/skills/vllm-triton-release-scan" = ["skills/vllm-triton-release-scan/SKILL.md"]
 "share/vllm-kernel-tools/skills/vllm-ascend-kernel-cases" = ["skills/vllm-ascend-kernel-cases/SKILL.md"]
 "share/vllm-kernel-tools/skills/vllm-triton-remote-benchmark" = ["skills/vllm-triton-remote-benchmark/SKILL.md"]
+"share/vllm-kernel-tools/skills/vllm-mrv2-kernel-workflow" = ["skills/vllm-mrv2-kernel-workflow/SKILL.md"]
+"share/vllm-kernel-tools/skills/vllm-mrv2-kernel-workflow/references" = ["skills/vllm-mrv2-kernel-workflow/references/*.md"]
+"share/vllm-kernel-tools/skills/vllm-mrv2-kernel-workflow/agents" = ["skills/vllm-mrv2-kernel-workflow/agents/openai.yaml"]

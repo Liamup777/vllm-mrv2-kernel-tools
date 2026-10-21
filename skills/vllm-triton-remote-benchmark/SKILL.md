@@ -5,11 +5,13 @@ description: Run source-grounded single-operator cases on a configured Ascend SS
 
 # Remote execution
 
+For a direct user request, start with [the workflow entry](../vllm-mrv2-kernel-workflow/SKILL.md) and its setup and execution references. In controller-provided read-only diagnosis, do not run these commands or recurse into the workflow.
+
 Use [README](../../README.md) for init/doctor/run commands. Targets come from the local kernel-tools.json; no hardcoded password or automatic host-key bypass. Inspect doctor output, source HEAD/dirty state, Python imports, package versions including triton-ascend, visible-device mapping and NPU occupancy before selecting an idle device. Do not terminate unrelated processes.
 
 For case generation apply [kernel cases](../vllm-ascend-kernel-cases/SKILL.md). Verify upstream target versus Ascend replacement explicitly. Uploading this versioned standalone tool is intentional; no switch to kernel_test_frame or replacement of the user's production runner is needed.
 
-Run one smoke case, then all planned cases using `python -m kernel_tools run CASES --target NAME`. The tool sequentially isolates cases in processes, retains failures and continues. Source/input/environment changes require a new run. Resume is only safe with matching source, cases, environment and tool. After an SSH interruption inspect the old process and remote run path before restarting.
+When a source lock exists, first run `python -m kernel_tools verify GENERATION_DIR --npu NAME`; standalone `run` does not check it. Run one smoke case, then all planned cases using `python -m kernel_tools run CASES --target NAME`. The tool sequentially isolates cases in processes, retains failures and continues. Source/input/environment changes require a new run. Resume is only safe with matching source, cases, environment and tool. After an SSH interruption inspect the old process and remote run path before restarting.
 
 Keep cases/, results/, report.md and only failed logs/. Report original execution facts and distinguish input/import/compile/runtime/correctness/timeout/blocked. Failed logs remain complete; summaries stay short. Never silently modify kernel source or substitute simpler input to present the original failure as a pass.
 

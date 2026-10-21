@@ -47,10 +47,10 @@ def validate_bundle(bundle, operator, runtime_sources):
         if path not in runtime_sources:
             path = target_module.replace(".", "/") + "/__init__.py"
         if path not in runtime_sources:
-            raise ValueError(f"Case target absent from actual NPU source snapshot: {case['target']}")
+            raise ValueError(f"Case target absent from supplied local source snapshot: {case['target']}")
         definition = Module(path, runtime_sources[path]).functions.get(target_module + "." + symbol)
         if not definition or not definition["jit"]:
-            raise ValueError(f"Case target is not a Triton JIT kernel in NPU source: {case['target']}")
+            raise ValueError(f"Case target is not a Triton JIT kernel in supplied source: {case['target']}")
     return cases
 
 
@@ -211,6 +211,8 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
         raise ValueError("generate --kernel requires at least one local --source file or directory")
     if source_ref and not selected_kernels:
         raise ValueError("--ref is only supported with generate --kernel")
+    if not prepare_only and not npu:
+        raise ValueError("pipeline requires --npu for execution; use --prepare-only for local generation")
     target_config = load_target(config, npu) if npu else None
     configured_codex = resolve_codex(config, codex)
     device = device or (target_config.get("device", "npu:0") if target_config else "npu:0")
@@ -334,10 +336,14 @@ def _execute_workflow(repo, base, target, npu, config, output, *, scope="vllm/v1
                       else "Static scan and exact Git ref source extraction",
                       "1/3" if operation == "generate" else "1/6")
                 delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
+                if resume and state.get("delta"):
+                    for side in ("base", "target"):
+                        if state["delta"][side]["commit"] != delta[side]["commit"]:
+                            raise ValueError(f"Resume {side} commit changed; use a new output directory")
                 state["delta"] = delta
                 before = json.loads((workspace / "scan/base.json").read_text())
-                write_sources(repo, base, workspace / "base")
-                commit, target_sources = write_sources(repo, target, workspace / "target")
+                write_sources(repo, delta["base"]["commit"], workspace / "base")
+                commit, target_sources = write_sources(repo, delta["target"]["commit"], workspace / "target")
                 if scan_input:
                     scan_file, scan_document = load_scan_result(scan_input)
                     expected_scan = {

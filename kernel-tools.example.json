@@ -1,0 +1,17 @@
+{
+  "ai": {
+    "codex": "codex"
+  },
+  "targets": {
+    "my-npu": {
+      "host": "npu-lab",
+      "container": "vllm-container",
+      "python": "python3",
+      "cwd": "/workspace/vllm-ascend",
+      "pythonpath": ["/workspace/vllm", "/workspace/vllm-ascend"],
+      "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
+      "device": "npu:0",
+      "result_root": "/workspace/kernel-results"
+    }
+  }
+}

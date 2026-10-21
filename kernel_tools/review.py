@@ -174,7 +174,7 @@ def render_review(root, document):
                 lines += ["无。", ""]
             for row in groups[category]:
                 lines += [f"### `{row.get('kernel', row['id'].rsplit('.', 1)[-1])}`", "",
-                          f"定义：`{row.get('definition', '未由目标 tag 源码解析')}`", "",
+                          f"定义：`{row.get('definition', '未由目标 ref 源码解析')}`", "",
                           row["reason"], "", "源码证据：" + row["evidence"], ""]
         lines += ["## 未解决项与边界", "", *["- " + item for item in review["unresolved"]], "",
                   "AI 源码复核仍可能遗漏动态路径；未验证 Ascend 实际绑定、数值精度或运行性能。", "",
@@ -233,8 +233,8 @@ def scan_with_ai(repo, base, target, output, *, scope="vllm/v1/worker/gpu",
             print("[scan] Preparing exact Git ref sources and candidate hints", flush=True)
             delta = write_scan(repo, base, target, workspace / "scan", scope, announce=False)
             before = json.loads((workspace / "scan/base.json").read_text())
-            write_sources(repo, base, workspace / "base")
-            _, sources = write_sources(repo, target, workspace / "target")
+            write_sources(repo, delta["base"]["commit"], workspace / "base")
+            _, sources = write_sources(repo, delta["target"]["commit"], workspace / "target")
             document.update(base=delta["base"], target=delta["target"], static_delta=delta)
             render_review(root, document)
             print("[scan] Codex is applying vllm-triton-release-scan; reviewing source evidence", flush=True)

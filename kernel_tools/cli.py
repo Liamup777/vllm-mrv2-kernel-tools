@@ -12,17 +12,8 @@ from .common import save_json
 
 
 def template():
-    return {"ai": {"codex": "codex"}, "targets": {
-        "npu160": {"host": "root@192.168.13.160", "container": "vllm_liam",
-                   "python": "python3", "cwd": "/vllm-workspace/vllm-ascend",
-                   "pythonpath": ["/vllm-workspace/vllm", "/vllm-workspace/vllm-ascend"],
-                   "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
-                   "device": "npu:0", "result_root": "/home/lingmutian/triton_kernel"},
-        "npu165": {"host": "root@192.168.13.165", "container": "vllm_lmt",
-                   "python": "python3", "cwd": "/home/lingmutian/code/vllm-ascend",
-                   "pythonpath": ["/home/lingmutian/code/vllm", "/home/lingmutian/code/vllm-ascend"],
-                   "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
-                   "device": "npu:0", "result_root": "/home/lingmutian/triton_kernel"}}}
+    from .review import resource_root
+    return json.loads((resource_root() / "kernel-tools.example.json").read_text())
 
 
 def parser():
@@ -101,7 +92,7 @@ def parser():
     flow.add_argument("--repo", type=Path, required=True)
     flow.add_argument("--base", required=True, help="基线 vLLM tag 或 7-40 位 commit SHA")
     flow.add_argument("--target", required=True, help="待测 vLLM tag 或 7-40 位 commit SHA")
-    flow.add_argument("--npu", required=True, help="kernel-tools.json 中的远端目标，如 npu165")
+    flow.add_argument("--npu", help="kernel-tools.json 中的远端目标，如 my-npu；--prepare-only 时可省略")
     flow.add_argument("--source", type=Path, action="append", default=[],
                       help="生成 case 时额外读取的本地源码仓库或目录；可重复")
     flow.add_argument("--config", type=Path, default=Path("kernel-tools.json"))
@@ -159,7 +150,8 @@ def main(argv=None):
             if args.output.exists():
                 raise ValueError(f"Already exists: {args.output}; edit this config directly")
             save_json(args.output, template())
-            print(f"Created {args.output}. Verify host/container/source paths, then run doctor --npu npu160.")
+            print(f"Created {args.output}. Edit the my-npu example for your SSH alias, container and paths; "
+                  "then run doctor --config <this-file> --npu my-npu. No connection was made.")
         elif args.command == "cases":
             cases = select_cases(load_cases(args.path), args.kernel, args.case_name)
             if args.action == "list":

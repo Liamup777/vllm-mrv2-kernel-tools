@@ -1,106 +1,179 @@
 # vLLM Kernel Tools
 
-一个用于 vLLM MRV2 Triton 版本检查和 Ascend 单算子测试的小工具。
+面向 vLLM MRV2 Triton 变更检查与 Ascend 单算子测试的 **Python 工具 + Agent Skill**。
 
-- 一条 `pipeline` 命令串联版本扫描、Codex/skill 用例生成、NPU 执行和失败分析。
-- `scan`、`generate`、`run` 也可分别执行；每一步直接消费上一步的持久化产物。
-- 使用 JSON/JSONL case 直接执行 `kernel[grid](...)`，只测 Triton kernel 本体。
-- 一条命令按算子或 case 筛选、运行、汇总；失败保存完整日志。
-- 从指定 Git tag 或 commit 扫描静态候选并比较源码，不切换被测仓库的分支。
-- 控制端只需 Python 3.10+；NPU 执行端使用已有 Torch / torch_npu / Triton / CANN 环境。
+- 比较两个 Git tag 或 commit，复核直接 launch 的 Triton 算子变化。
+- 根据本地 vLLM / vLLM-Ascend 源码，为确认新增的算子或指定 kernel 生成 JSON 用例。
+- 可选连接 SSH / Docker NPU 环境，校验源码 commit，逐 case 执行并保存结果和失败日志。
+- 用户从总入口 Skill 提出任务，固定 Python 程序负责各阶段编排；无需手动依次调用内部 Skill。
 
-## 完整流程（推荐入口）
+边界：CLI `scan` 是两版本差异复核，不是单版本全量 XLSX 清单工具。用例直接执行 `kernel[grid](...)`；运行成功只说明执行/测量完成，当前数值正确性统一为 `correctness=not_checked`。
 
-```bash
-python3 -m kernel_tools pipeline --repo ../vllm \
-  --source ../vllm-ascend \
-  --base v0.28.0 --target v0.29.0 --npu npu165
-```
+## 1. 获取仓库与安装工具
 
-首次使用需先登录 Codex CLI、核对 `kernel-tools.json` 并配置 SSH 密钥登录。加 `--dry-run` 只看计划。默认使用本机 Codex 模型和推理强度配置；`--model` 与 `--reason` 可为单次运行覆盖。详见 [完整流程说明](docs/pipeline.md)。
-
-运行时会显示 1/6 至 6/6 的阶段、逐算子生成进度、实际 Codex CLI/模型，以及长 AI 调用的 30 秒心跳。`scan`、`generate`、`run` 和 `pipeline` 都支持在原 `--output` 上追加 `--resume`；完成项会在身份校验通过后复用。
-
-生成的用例默认保存在本次运行目录的 `cases/` 中；使用 `--cases-output ~/vllm-kernel-cases/v0.29.0` 可指定独立目录。`--output` 仍指定整次运行的报告目录。未设置输出目录时，macOS 默认写入 `~/Library/Application Support/vllm-kernel-tools/`，不会在工具仓库生成运行文件；其他系统使用各自的用户数据目录。可通过 `VLLM_KERNEL_TOOLS_HOME` 改写根目录。
-
-三个阶段也可以独立执行：
+本机需要 Python 3.11+、Git。扫描和用例生成还需要单独安装、认证可用的 Codex CLI。仅查看帮助、校验 case、dry-run 不需要 AI 或 NPU。远端需用户自行准备相互兼容的 Torch、torch_npu、Triton-Ascend、CANN、vLLM 和 vLLM-Ascend 环境。
 
 ```bash
-python3 -m kernel_tools scan --repo ../vllm \
-  --base v0.28.0 --target v0.29.0 --output ~/kernel-results/scan-029
+git clone https://github.com/Liamup777/vllm-mrv2-kernel-tools.git
+cd vllm-mrv2-kernel-tools
 
-python3 -m kernel_tools generate --scan ~/kernel-results/scan-029 \
-  --repo ../vllm --source ../vllm-ascend \
-  --output ~/kernel-results/generate-029
-
-python3 -m kernel_tools run ~/kernel-results/generate-029 \
-  --npu npu162 --output ~/kernel-results/run-029
-```
-
-`scan` 和 `pipeline` 的 `--base`、`--target` 均可使用本地 tag，或 7–40 位十六进制 commit SHA。例如：
-
-```bash
-python3 -m kernel_tools scan --repo ../vllm \
-  --base db9527a46873 --target ced6857afa0ea7b2e3f0846a62e1394e90f15607 \
-  --output ~/kernel-results/scan-by-commit
-```
-
-commit 必须已存在于本地仓库。工具通过 Git object 读取源码，不 checkout 或修改当前工作区；建议在可复现流程中使用完整的 40 位 SHA。
-
-`generate` 复用 `scan` 的 AI 复核结果，不重复调用 release review；它只读取本地 `--repo` 和 `--source`，不连接 NPU。生成目录中的 `source-lock.json` 只记录 `vllm` / `vllm_ascend` commit，供 `pipeline` 和显式 `verify` 做版本门禁。独立 `run` 只读取所选 case 并执行，不检查 commit 或工作区 clean，也不要求 case 旁存在 `source-lock.json`。`cases list/validate` 只用于查看和静态校验已有 case，不负责生成。
-
-如果已经知道要测试的 kernel，可以完全跳过版本扫描：
-
-```bash
-python3 -m kernel_tools generate \
-  --kernel _fill_num_accepted_kernel \
-  --source ../vllm/vllm/v1/worker/gpu/model_states/mamba_hybrid.py \
-  --output ~/kernel-results/fill-num-accepted \
-  --model gpt-5.6-sol --reason medium
-```
-
-`--kernel` 可重复指定多个算子，`--source` 可指向本地文件或目录。工具只在指定范围定位 `@triton.jit` 定义，并补充包含该 kernel 名称的 Python 调用文件，不枚举两个仓库的全部 Triton 定义。短名称有重名时要求使用完整 Python ID，例如 `vllm_ascend.ops.example.example_kernel`。`--ref COMMIT` 可从指定 Git revision 读取源码；省略时读取当前 worktree。此模式不需要 `--repo`、`--target` 或 NPU，也不调用 release-scan AI。
-
-需要单独确认远端版本时运行：
-
-```bash
-python3 -m kernel_tools verify ~/kernel-results/fill-num-accepted --npu npu162
-```
-
-`run` 内部始终重复同样的校验，因此不能通过跳过 `verify` 绕过源码约束。
-
-## 最快开始
-
-在这个仓库根目录运行，无需安装依赖：
-
-```bash
-python -m kernel_tools --help
-python -m kernel_tools cases list examples/fill_num_accepted.json
-python -m kernel_tools cases validate examples/fill_num_accepted.json
-python -m kernel_tools run examples/fill_num_accepted.json --dry-run
-python -m kernel_tools run examples/fill_num_accepted.json --case-name smoke
-```
-
-`run --case-name <name>` 只运行指定场景；如果不同 kernel 使用了相同场景名，再加 `--kernel <name>`。执行时终端会实时显示环境检查、当前 case、worker stdout/stderr 和最终状态；失败输出同时完整保存在 `logs/` 并链接到报告。
-
-也可以安装命令行入口（不安装/升级 NPU 依赖）：
-
-```bash
-python -m pip install -e . --no-deps
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e . --no-deps
 kernel-tools --help
 ```
 
-`python -m kernel_tools` 与 `kernel-tools` 完全等价。示例有 3 个 `_fill_num_accepted_kernel` case；示例 JSON 的 `source` 记录生成依据，换源码版本后应重新核对。当前框架不内置单算子 reference，运行成功仍会明确记录 `correctness=not_checked`。
+已有仓库和可用 Python 环境时，无需重新 clone 或创建环境，在仓库根目录安装即可。控制端没有第三方 Python 运行依赖；构建安装可能下载 setuptools，不会安装或升级 NPU 软件栈。
 
-## 从本机跑远端 NPU
-
-先生成配置文件：
+`kernel-tools` 与同一 Python 环境中的 `python -m kernel_tools` 等价。若不安装，也可从仓库根目录直接使用后者。让 Agent 执行时，应提供该虚拟环境的 Python/CLI 路径，不能假定另一个终端的 `activate` 会影响 Agent。
 
 ```bash
-python -m kernel_tools init
+codex --version
 ```
 
-这会在当前目录创建 `kernel-tools.json`。文件已存在时不会覆盖，直接编辑即可。每个 `targets` 成员是一套 NPU 环境，名称由 `--npu` 引用。例如 Docker 环境：
+这只检查 Codex CLI 可执行文件，不证明认证可用。沿用你自己的 Codex 安装与认证方式；非 PATH 中的可执行文件可通过 `--codex /absolute/path/to/codex` 或配置文件的 `ai.codex` 指定。默认沿用 Codex 模型配置，也可用 `--model`、`--reason` 单次覆盖。
+
+## 2. 加载 Skill
+
+**安装 Python 工具不等于注册 Skill。** 总入口为 [vllm-mrv2-kernel-workflow](skills/vllm-mrv2-kernel-workflow/SKILL.md)，以下两种加载方式任选一种。
+
+### 方式 A：直接提供入口路径
+
+让编程助手读取完整仓库中的入口，例如：
+
+```text
+请读取 /absolute/path/to/vllm-mrv2-kernel-tools/skills/vllm-mrv2-kernel-workflow/SKILL.md，
+按照这个 Skill 完成下面的任务。
+工具使用 /absolute/path/to/vllm-mrv2-kernel-tools/.venv/bin/python。
+```
+
+### 方式 B：接入项目的技能目录
+
+对于支持 `.agents/skills/` 和软链接发现的客户端，在 Linux/macOS 上从本工具仓库根目录执行。将 `project_dir` 替换为实际项目的绝对路径：
+
+```bash
+skill_repo="$(pwd -P)"
+project_dir="/absolute/path/to/your/project"
+skill_link="$project_dir/.agents/skills/vllm-mrv2-kernel-workflow"
+mkdir -p "$project_dir/.agents/skills"
+if [ -e "$skill_link" ] || [ -L "$skill_link" ]; then
+  echo "已有同名条目，请先检查：$skill_link"
+else
+  ln -s "$skill_repo/skills/vllm-mrv2-kernel-workflow" "$skill_link"
+fi
+```
+
+此命令只链接总入口，不覆盖已有文件、目录或软链接，也不修改 SSH/NPU 配置。保留整个工具仓库，不要移动或删除链接目标。入口要求按软链接的真实位置解析相邻 references、内部 Skill 和文档；不支持这种加载方式的客户端请使用方式 A。
+
+在目标项目中确认入口已被识别。Codex CLI/IDE 可通过 `/skills` 查看或用 `$vllm-mrv2-kernel-workflow` 显式调用；未刷新时重启客户端。机制见 [Codex Skill 官方说明](https://learn.chatgpt.com/docs/build-skills)。其他客户端按自己的技能发现规则加载，不假定调用语法相同。
+
+不能只孤立复制一个 `SKILL.md` 或单个 Skill 目录：本工作流依赖 Python 工具、内部 Skill 和相邻文档。普通 wheel 也包含完整资源，可在已安装的 Python 环境中定位：
+
+```bash
+python -c 'from kernel_tools.review import resource_root; print(resource_root())'
+```
+
+## 3. 本地使用：无需 NPU 配置
+
+先在工具仓库根目录检查本机工具，不会调用 AI 或连接远端：
+
+```bash
+kernel-tools cases list examples/fill_num_accepted.json
+kernel-tools cases validate examples/fill_num_accepted.json
+kernel-tools run examples/fill_num_accepted.json --dry-run
+```
+
+下面将路径、版本和输出目录替换为实际值。`--base` / `--target` 支持本地 tag 或 7–40 位十六进制 commit SHA，推荐完整 SHA；必须已存在于本地仓库，不接受分支名或 `HEAD~1` 等表达式。工具通过 Git object 读取它们，不切换源码分支。输出目录使用新的目录，恢复旧任务才加 `--resume`。
+
+### 只扫描变化
+
+给助手的任务：
+
+```text
+使用 vllm-mrv2-kernel-workflow。
+vLLM 仓库：/path/to/vllm
+基线：v0.28.0；目标：v0.29.0
+只扫描 MRV2 Triton 算子变化，不生成用例、不连接 NPU。
+输出到新的目录 /path/to/results/scan-029，交付复核报告和未解决项。
+```
+
+也可直接运行 CLI：
+
+```bash
+kernel-tools scan --repo /path/to/vllm \
+  --base v0.28.0 --target v0.29.0 \
+  --output /path/to/results/scan-029
+```
+
+此阶段会调用 AI，输出 `review.json` 和 `review.md`；`scan` 没有 `--dry-run`。静态 AST 候选只是辅助，AI 失败不会被包装成“复核通过”。
+
+### 扫描并生成用例，暂不执行
+
+给助手的任务：
+
+```text
+使用 vllm-mrv2-kernel-workflow。
+比较 /path/to/vllm 的 v0.28.0 与 v0.29.0，
+结合 /path/to/vllm-ascend 的本地源码，为确认新增的算子生成用例。
+只准备，不连接 NPU。输出到新的目录 /path/to/results/prepared-029。
+```
+
+```bash
+kernel-tools pipeline --repo /path/to/vllm \
+  --source /path/to/vllm-ascend \
+  --base v0.28.0 --target v0.29.0 \
+  --prepare-only --output /path/to/results/prepared-029
+```
+
+`--prepare-only` 仍会调用 AI；再加 `--dry-run` 才只显示计划。已有 scan 结果时用 `generate --scan` 复用复核，不必重复扫描，详见 [分阶段命令](docs/pipeline.md)。
+
+### 只为指定 kernel 生成用例
+
+无需比较版本，给助手 kernel 名和本地源码范围即可：
+
+```bash
+kernel-tools generate --kernel _fill_num_accepted_kernel \
+  --source /path/to/vllm/vllm/v1/worker/gpu/model_states/mamba_hybrid.py \
+  --output /path/to/results/fill-num-accepted
+```
+
+按你的源码选择实际存在的 kernel/文件。`--kernel` 和 `--source` 可重复；有重名时使用完整 Python ID。默认读取当前 worktree，`--ref COMMIT` 可选历史源码。此模式跳过 release review，只调用用例生成。
+
+## 4. 配置远端 NPU（仅远端执行需要）
+
+已有可用配置可直接沿用，不需要重新生成密钥或重建 JSON。以下是新用户的配置步骤。
+
+### 4.1 准备 SSH 免密访问
+
+`kernel-tools` 通过 OpenSSH 的 `BatchMode=yes` 连接，不弹出密码提示，也不保存密码。私钥、端口、跳板机配置属于 SSH，而不是 JSON。
+
+在本机 `~/.ssh/config` 中按实际环境添加或复用别名，例如：
+
+```sshconfig
+Host npu-lab
+    HostName npu.example.com
+    User developer
+    IdentityFile ~/.ssh/id_ed25519
+    IdentitiesOnly yes
+```
+
+`HostName`、用户和私钥路径都需替换。优先复用已有密钥；尚未安装公钥时，可按管理员流程或 `ssh-copy-id -i /path/to/key.pub user@host` 配置。首次连接应核对服务器指纹，不关闭主机密钥校验。随后检查非交互认证：
+
+```bash
+ssh -o BatchMode=yes -o ConnectTimeout=10 npu-lab true
+```
+
+这只验证 SSH，不证明 Docker、Python 或 NPU 栈可用。
+
+### 4.2 配置执行目标
+
+在工具仓库根目录执行：
+
+```bash
+kernel-tools init --output kernel-tools.json
+```
+
+命令从 [通用模板](kernel-tools.example.json) 创建文件，不连接远端，不覆盖已有配置。将示例值改为实际环境：
 
 ```json
 {
@@ -108,192 +181,164 @@ python -m kernel_tools init
     "codex": "codex"
   },
   "targets": {
-    "npu162": {
-      "host": "root@192.168.13.162",
-      "container": "vllm_lmt",
+    "my-npu": {
+      "host": "npu-lab",
+      "container": "vllm-container",
       "python": "python3",
-      "cwd": "/home/lingmutian/code/vllm-ascend",
-      "pythonpath": [
-        "/home/lingmutian/code/vllm",
-        "/home/lingmutian/code/vllm-ascend"
-      ],
+      "cwd": "/workspace/vllm-ascend",
+      "pythonpath": ["/workspace/vllm", "/workspace/vllm-ascend"],
       "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
       "device": "npu:0",
-      "result_root": "/home/lingmutian/triton_kernel",
-      "env": {
-        "ASCEND_RT_VISIBLE_DEVICES": "0"
-      }
+      "result_root": "/workspace/kernel-results"
     }
   }
 }
 ```
 
-字段含义：
+| 项目 | 配置含义及注意点 |
+|---|---|
+| `my-npu` | 工具的目标名称，由 `--npu my-npu` 选择；不是 IP 或卡号 |
+| `host` | SSH 别名或 `user@host`；可以与目标名称不同 |
+| `container` | 已启动的 Docker 容器名；裸机运行时删除这一项 |
+| `python` | 远端执行环境中的 Python，必须能导入被测软件栈 |
+| `cwd` | 远端工作目录，必须为绝对路径 |
+| `pythonpath` | 远端 vLLM / vLLM-Ascend 源码根目录，按列表顺序加入 `PYTHONPATH` |
+| `setup` | 可选的 Ascend 环境脚本，执行 Python 前加载 |
+| `device` | 进程内逻辑设备，CLI `--device` 可覆盖；需核对容器和可见设备映射 |
+| `result_root` | 远端结果保留目录；Docker 模式建议位于持久化挂载路径 |
+| `env` | 可选环境变量字典，例如 `ASCEND_RT_VISIBLE_DEVICES`；不要放密码或 token |
 
-| 字段 | 是否必需 | 含义 |
-|---|---|---|
-| `host` | 是 | SSH alias 或 `user@host`。工具使用 `BatchMode=yes`，需提前配置 SSH key/agent 和主机指纹。 |
-| `container` | 否 | Docker 容器名。设置后，后续路径和 Python 都按容器内环境解释；省略则直接在远端宿主机运行。 |
-| `python` | 是 | 远端或容器内 Python 命令，例如 `python3` 或虚拟环境绝对路径。该环境需已安装 Torch、torch_npu、Triton 和 vLLM 运行依赖。 |
-| `cwd` | 是 | vLLM-Ascend 工作目录，必须是远端运行环境中的绝对路径。 |
-| `pythonpath` | 否 | 实际使用的 vLLM、vLLM-Ascend 等源码路径，必须使用绝对路径。顺序就是 `PYTHONPATH` 顺序。 |
-| `setup` | 否 | 执行 Python 前通过 `source` 加载的 Ascend 环境脚本。Docker 模式下必须是容器内路径。 |
-| `device` | 否 | 进程内逻辑设备，默认 `npu:0`。 |
-| `result_root` | 是 | 远端结果保留目录，必须是绝对路径；Docker 模式下是容器内路径，建议对应持久化挂载目录。 |
-| `env` | 否 | 额外环境变量，例如用 `ASCEND_RT_VISIBLE_DEVICES` 把物理卡映射为进程内的 `npu:0`。不要在这里保存密码或 token。 |
+路径分两侧：CLI 的 `--repo`、`--source`、`--config`、`--output` 是本地路径；JSON 中 `cwd`、`pythonpath`、`setup`、`result_root` 是远端路径，设置 `container` 后均按容器内路径解释。`--output` 和 `result_root` 不是同一个目录。
 
-裸机环境删除 `container` 即可，例如：
+`device` 不是始终等于宿主机物理卡号。设置可见设备变量或使用部分设备挂载后，应在实际容器/Python 环境中确认逻辑编号与物理卡的对应关系，再选空闲设备；不能仅凭 `npu:0` 判断用了哪张卡。
 
-```json
-{
-  "host": "npu-host-alias",
-  "python": "/opt/venvs/vllm/bin/python",
-  "cwd": "/workspace/vllm-ascend",
-  "pythonpath": ["/workspace/vllm", "/workspace/vllm-ascend"],
-  "setup": "/usr/local/Ascend/ascend-toolkit/set_env.sh",
-  "device": "npu:0",
-  "result_root": "/workspace/kernel-results"
-}
-```
+工具会上传运行器和用例，不要求远端预装本工具，但不会自动安装 NPU 依赖、启动容器、同步生产源码或切换远端分支。Docker 模式需当前 SSH 用户有 `docker exec` / `docker cp` 权限。
 
-### 配置 SSH 免密连接
+配置文件在本仓库内已被 Git 忽略；若保存到其他项目也需自行排除。不要提交真实机器配置、密码、token 或私钥。配置可放任意私有位置，执行时显式传 `--config /absolute/path/to/kernel-tools.json`，避免 Agent 工作目录不同而读错文件。
 
-工具执行 SSH 时设置了 `BatchMode=yes`，不会弹出密码输入框，也不读取或保存服务器密码。需要提前配置 SSH key 或可用的 ssh-agent。
-
-本机还没有密钥时先生成一对：
+### 4.3 检查配置与实际环境
 
 ```bash
-ssh-keygen -t ed25519 -C "vllm-kernel-tools"
+# 只看计划，不连接远端
+kernel-tools doctor --config /path/to/kernel-tools.json --npu my-npu --dry-run
+
+# 实际检查 SSH、容器、Python import 和 NPU 环境
+kernel-tools doctor --config /path/to/kernel-tools.json --npu my-npu
 ```
 
-第一次把公钥安装到 NPU 服务器时，可以在终端中手动输入一次服务器密码：
+检查实际 import 路径、包版本、设备可用性和占用状态，不只看 SSH 是否成功。`doctor` 通过也不代表待测 kernel 可编译或数值正确。
+
+## 5. 执行远端测试
+
+### 使用已生成用例
+
+先列出用例、检查格式，并校验远端实际导入仓库的 commit：
 
 ```bash
-ssh-copy-id root@192.168.13.162
+kernel-tools cases list /path/to/results/prepared-029/cases
+kernel-tools cases validate /path/to/results/prepared-029/cases
+kernel-tools verify /path/to/results/prepared-029 \
+  --config /path/to/kernel-tools.json --npu my-npu
 ```
 
-如果系统没有 `ssh-copy-id`，可以使用：
+`verify` 成功且源码保持不变后，选择实际列出的一个 smoke case，再运行完整用例。下面的 `KERNEL_NAME` 和 `SMOKE_CASE_NAME` 必须替换：
 
 ```bash
-cat ~/.ssh/id_ed25519.pub | ssh root@192.168.13.162 \
-  'umask 077; mkdir -p ~/.ssh; cat >> ~/.ssh/authorized_keys'
+kernel-tools run /path/to/results/prepared-029 \
+  --kernel KERNEL_NAME --case-name SMOKE_CASE_NAME \
+  --config /path/to/kernel-tools.json --npu my-npu \
+  --output /path/to/results/smoke-029
+
+kernel-tools run /path/to/results/prepared-029 \
+  --config /path/to/kernel-tools.json --npu my-npu \
+  --output /path/to/results/run-029
 ```
 
-随后用与工具完全相同的非交互方式检查认证：
+上述执行沿用配置中的设备。独立 `run` **不会自动校验 source lock**；有 lock 时先 `verify`，失败就停止。手写无 lock 的 case 仍能运行，但应另行记录实际源码身份。
 
-```bash
-ssh -o BatchMode=yes -o ConnectTimeout=10 root@192.168.13.162 true
-```
+### 从扫描到执行一条命令完成
 
-命令无输出且退出码为 0，就可以在配置中使用 `"host": "root@192.168.13.162"`。也可以在 `~/.ssh/config` 中配置私钥、端口、跳板机或 alias：
-
-```sshconfig
-Host npu162
-  HostName 192.168.13.162
-  User root
-  IdentityFile ~/.ssh/id_ed25519
-```
-
-此时 `kernel-tools.json` 可简化为 `"host": "npu162"`。如果服务器只允许密码登录且不能安装公钥，当前工具不能连接；不要把密码写入配置文件或命令行。
-
-工具不要求 NPU 环境预先安装 `vllm-kernel-tools`。运行时会通过 SSH 把工具代码和 JSON case 上传到远端临时目录；目标环境只需具备被测运行栈。Docker 模式还要求远端用户能执行 `docker exec`、`docker cp`，且目标容器已经启动。
-
-配置后先检查连接、环境和实际 import 路径：
-
-```bash
-python -m kernel_tools doctor --config kernel-tools.json --npu npu162
-```
-
-`doctor` 会显示 Python、Torch、torch_npu、Triton、CANN、NPU 状态，以及 vLLM/vLLM-Ascend 的实际 import 位置。若这里显示的源码路径与 `pythonpath` 预期不一致，应先修正配置，不要直接运行 pipeline。
-
-只检查将要使用的 SSH/Docker 命令而不连接远端：
-
-```bash
-python -m kernel_tools doctor --config kernel-tools.json --npu npu162 --dry-run
-```
-
-确认环境后运行单算子 case：
-
-```bash
-python -m kernel_tools run examples/fill_num_accepted.json \
-  --config kernel-tools.json --npu npu162 \
-  --case-name smoke_b1 --output artifacts/smoke
-
-python -m kernel_tools run examples/fill_num_accepted.json \
-  --config kernel-tools.json --npu npu162 --output artifacts/fill-all
-```
-
-工具自动上传自身和 JSON case 到临时目录，在容器中使用配置的源码运行，再把报告、case、结果、失败日志取回本地。远端结果也保留在配置的 `result_root`。无需切换 vllm-ascend 到 `kernel_test_frame`，也不会重装远端 Torch/Triton。输入构造由统一测试框架提供，自动流程不生成辅助 Python 文件或单算子 reference。
-
-查看计划而不连接远端：
-
-```bash
-python -m kernel_tools run examples/fill_num_accepted.json --npu npu165 --dry-run
-```
-
-## 在 NPU 环境内直接运行
-
-在已初始化 Ascend 环境的终端中：
-
-```bash
-python -m kernel_tools doctor
-python -m kernel_tools run examples/fill_num_accepted.json \
-  --cwd /home/lingmutian/code/vllm-ascend \
-  --pythonpath /home/lingmutian/code/vllm \
-  --pythonpath /home/lingmutian/code/vllm-ascend \
-  --device npu:0 --warmup 10 --rounds 100 --timeout 600 \
-  --output artifacts/fill-all
-```
-
-`npu:0` 是进程中的逻辑设备编号；需要物理卡映射时在配置的 `env` 中设置 `ASCEND_RT_VISIBLE_DEVICES`。设备锁只约束本工具的作业，不能阻止外部程序占用 NPU；不要把拿到锁当作设备独占证明。
-
-支持输入一个目录运行其中所有 `.json` / `.jsonl` case，支持 `--kernel` 和 `--case-name` 精确筛选。失败不会中止后续 case；Ctrl-C 会记录当前中断并把剩余项标为 blocked。设备环境不可用时所有选中 case 都有 blocked 结果。
-
-断点续跑使用完全相同的命令与 `--output`，追加 `--resume`。本地和 `--npu` 远端运行都会复用成功项，只重跑未完成或失败 case。远端首次运行在本地输出目录保存 `remote-run.json`，恢复时复用其中的远端结果目录；若原远端进程仍在运行则拒绝重复启动。case、目标配置、工具代码、source lock 或测量参数发生变化时拒绝复用。旧版没有 source lock 的手写 case 仍沿用原有运行规则。
-
-## 结果只有需要的东西
+给助手的任务示例：
 
 ```text
-artifacts/fill-all/
-  cases/       # 真正执行的 case，每个算子一份
-  results/     # 每个算子的所有场景结果和实际绑定
-  logs/        # 仅失败场景的完整日志
-  source-lock.json  # 生成依据的 vllm / vllm-ascend commit（generate/pipeline）
-  report.md    # 场景结果、耗时、失败原因与日志链接
+使用 vllm-mrv2-kernel-workflow 执行完整流程。
+vLLM：/path/to/vllm；Ascend：/path/to/vllm-ascend
+基线：v0.28.0；目标：v0.29.0
+配置：/path/to/kernel-tools.json；目标名称：my-npu；设备沿用配置。
+输出：新的目录 /path/to/results/pipeline-029。
+执行前检查环境和设备占用；源码 commit 不一致时停止，不自动切换远端分支。
+交付每个 case 的执行状态、报告路径及未验证的覆盖范围。
 ```
-
-文件名带短哈希，防止同名/长名称覆盖。成功只保留 mean/p50/p90/p99/min/max；不保存逐轮耗时、中间输入或成功日志。当前没有通用数值比较协议，因此报告统一使用 `correctness=not_checked`，不能把编译和运行成功解释为数值正确。
-
-## 扫描某个版本的变化
 
 ```bash
-python -m kernel_tools scan --repo ../vllm \
+kernel-tools pipeline --repo /path/to/vllm \
+  --source /path/to/vllm-ascend \
   --base v0.28.0 --target v0.29.0 \
-  --output ~/vllm-kernel-tools-output/v0.28.0--v0.29.0
+  --config /path/to/kernel-tools.json --npu my-npu \
+  --output /path/to/results/pipeline-029
 ```
 
-`scan` 自动调用 Codex 和 release-scan skill，只分析源码，不连接 NPU。控制端需要可用且已登录的 Codex CLI；可读取 `kernel-tools.json` 的 `ai.codex`，无需配置 NPU 目标。
+完整 `pipeline` 在执行前自动校验 source lock；远端 vLLM 必须匹配 target commit，所选 Ascend 源码也需匹配锁定的 commit。base 只需本地存在。校验只比对实际 import 对应的 Git HEAD，不检查工作区修改或逐文件哈希。
 
-扫描失败或中断后，可使用相同参数、原输出目录并追加 `--resume`。已完成的 review 直接复用；未完成的单次 AI review 会重新发起，因为 Codex 调用本身没有可恢复的中间状态。
+pipeline 不包含单独的 smoke-first 阶段，需要先试一个 case 时请使用前面的分阶段方式。完整命令加 `--dry-run` 不调用 AI、不连接远端，但需可解析的目标配置。
 
-输出 `review.md` 和 `review.json`。报告分别列出 AI 确认新增、待核实和已有/非新增项，不把已有算子的变化混入新增数。静态 AST 候选只作为内部辅助；读取精确 tag，不切换源码分支。
+### 在 NPU 环境内直接运行
 
-AI 会检查别名和显式导入的外部 Triton kernel，但复核仍可能遗漏。报告不是全覆盖证明，也不是 NPU 数值正确性或性能报告。AI 失败时明确记录失败及日志，不退回静态结果冒充复核完成。
+若本工具已在 NPU 环境的 Python 中可用，也可不经过 SSH：
 
-扫描的具体实现和 AI 参与的边界见 [扫描原理与手动流程](docs/scanning.md)。
+```bash
+kernel-tools doctor
+kernel-tools run /path/to/cases.json \
+  --cwd /workspace/vllm-ascend \
+  --pythonpath /workspace/vllm --pythonpath /workspace/vllm-ascend \
+  --device npu:0 --warmup 10 --rounds 100 --timeout 600 \
+  --output /workspace/kernel-results/local-run
+```
 
-## 目录与开发
+先初始化该环境的 CANN/设备设置。有 source lock 时也应先在同一 import 环境显式 `verify`。设备锁只约束本工具的作业，不证明 NPU 没有被其他程序占用。
 
-| 目录 | 内容 |
+## 6. 结果、恢复与排错
+
+| 阶段 | 主要产物 | 能说明什么 |
+|---|---|---|
+| scan | `review.json`、`review.md` | AI 源码复核及未解决项，不是运行覆盖证明 |
+| generate / prepare | `cases/`、`source-lock.json`、`workflow.json`、`report.md` | 用例已准备，不代表已执行 |
+| run | `cases/`、`results/`、`report.md`、失败 `logs/` | 每个 case 的实际执行/测量状态；SSH 模式另保留本地 `remote-run.json` |
+| pipeline | 上述对应阶段的产物 | 按最后到达的阶段解释，不能把准备完成当成测试通过 |
+
+运行过程显示阶段、逐算子进度和 AI 调用心跳；失败保留完整日志。当前不提供通用数值比较协议，`success` 不能解释为精度正确、模型功能已覆盖或端到端性能提升。
+
+`scan`、`generate`、`run`、`pipeline` 支持原 `--output` 加 `--resume`，但须保持对应输入身份不变。SSH 中断后先确认旧作业状态；独立远端 run 会检查活动进程，pipeline 恢复可能新建执行目录，不要盲目重复启动。源码变更后重新核对 lock 并使用新输出目录。细节见 [恢复规则](docs/pipeline.md)。
+
+可用 `--cases-output` 指定独立用例目录。默认运行产物位于系统用户数据目录，不写工具仓库；macOS 使用 `~/Library/Application Support/vllm-kernel-tools/`，可用 `VLLM_KERNEL_TOOLS_HOME` 修改根目录。
+
+常见问题：
+
+- 找不到 `kernel-tools`：确认 Agent/终端使用安装它的 Python 环境，或使用 `.venv/bin/kernel-tools` 的绝对路径。
+- Skill 未发现：检查客户端技能目录和软链接目标，或直接提供完整 `SKILL.md` 路径。
+- SSH 超时/认证失败：先检查 `ssh -o BatchMode=yes ... true`，不要把密码写进 JSON。
+- 容器未运行：核对 `container` 和 Docker 权限，不能当作 kernel 失败。
+- commit 不一致：停止测试，核对 `pythonpath`、实际 import 和目标版本，不绕过 source lock。
+- Triton 导入/编译失败：按日志区分环境兼容性和 kernel 输入/实现问题，不能直接归因于算子。
+
+更多细节见 [排错参考](skills/vllm-mrv2-kernel-workflow/references/troubleshooting.md)、[case 格式](docs/cases.md) 和 [扫描原理](docs/scanning.md)。
+
+## Skill 目录与开发验证
+
+| Skill | 职责 |
 |---|---|
-| `kernel_tools/` | 固定程序：CLI、扫描、校验、SSH/Docker 执行、报告 |
-| `examples/` | 可读、可筛选的最小 case 示例 |
-| `skills/` | AI 处理调用链、输入契约和失败分析时的规范 |
-| `docs/` | case 扩展、扫描原理与手动流程 |
-| `tests/` | 无需 NPU 的协议、异常路径和版本扫描检查 |
+| [vllm-mrv2-kernel-workflow](skills/vllm-mrv2-kernel-workflow/SKILL.md) | 用户总入口；按需读取配置、流程、验收及排错 references |
+| [vllm-triton-release-scan](skills/vllm-triton-release-scan/SKILL.md) | 控制器内部的差异复核 |
+| [vllm-ascend-kernel-cases](skills/vllm-ascend-kernel-cases/SKILL.md) | 控制器内部的输入契约分析与用例生成 |
+| [vllm-triton-remote-benchmark](skills/vllm-triton-remote-benchmark/SKILL.md) | 远端执行指导；控制器调用时只做只读失败分析 |
+
+在工具仓库根目录验证：
 
 ```bash
 python -m unittest discover -s tests -v
+python scripts/check_install.py
 ```
 
-本仓库测试模拟 worker 来检查编排协议、日志、超时和重跑规则，不能代替真实 NPU 编译/精度/性能验证。框架来源与改动见 [NOTICE](NOTICE)。
+第一项使用模拟 AI/worker/SSH 验证协议和异常路径；第二项构建 wheel，在临时虚拟环境、仓库外检查 CLI 和打包资源，可能下载构建依赖。它们不代表真实 AI 生成质量或 NPU 编译、精度、性能通过。
+
+框架来源与改动见 [NOTICE](NOTICE)。
